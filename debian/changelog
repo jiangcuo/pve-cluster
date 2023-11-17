@@ -1,3 +1,9 @@
+pve-cluster (7.0-1.1) UNSTABLE; urgency=medium
+
+  * add for riscv64 
+
+ -- Jiangcuo <jiangcuo@bingsinc.com>  Fri, 17 Nov 2023 09:09:30 +0000
+
 pve-cluster (7.0-1) bullseye; urgency=medium
 
   * re-build for Debian 11 Bullseye based releases

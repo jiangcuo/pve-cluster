@@ -3,7 +3,7 @@ DEPENDENCIES=libcpg libcmap libquorum libqb glib-2.0 fuse sqlite3 librrd
 
 CC = gcc
 CFLAGS += -std=gnu99
-CFLAGS += -Wall -Werror -Wno-unknown-pragmas -Wno-strict-aliasing
+CFLAGS += -Wall -Werror -Wno-unknown-pragmas -Wno-strict-aliasing -Wno-unused-result
 CFLAGS += -Wpedantic
 CFLAGS += -g -O2 -Wl,-z,relro
 CFLAGS += -I.
