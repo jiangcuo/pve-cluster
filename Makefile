@@ -1,44 +1,54 @@
-include /usr/share/dpkg/pkg-info.mk
-include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/default.mk
 
 PACKAGE=pve-cluster
+BUILDDIR ?= $(PACKAGE)-$(DEB_VERSION)
+DSC=$(PACKAGE)_$(DEB_VERSION).dsc
 
 GITVERSION:=$(shell git rev-parse HEAD)
 
-DEB=${PACKAGE}_${DEB_VERSION_UPSTREAM_REVISION}_${DEB_BUILD_ARCH}.deb
-LIB_DEB  = libpve-cluster-perl_${DEB_VERSION_UPSTREAM_REVISION}_all.deb
-LIB_DEB += libpve-cluster-api-perl_${DEB_VERSION_UPSTREAM_REVISION}_all.deb
-DBG_DEB=${PACKAGE}-dbgsym_${DEB_VERSION_UPSTREAM_REVISION}_${DEB_BUILD_ARCH}.deb
+DEB=$(PACKAGE)_$(DEB_VERSION)_$(DEB_BUILD_ARCH).deb
+LIB_DEB  = libpve-cluster-perl_$(DEB_VERSION)_all.deb
+LIB_DEB += libpve-cluster-api-perl_$(DEB_VERSION)_all.deb
+LIB_DEB += libpve-notify-perl_$(DEB_VERSION)_all.deb
+DBG_DEB=$(PACKAGE)-dbgsym_$(DEB_VERSION)_$(DEB_BUILD_ARCH).deb
 
-DEBS = ${DEB} ${DBG_DEB} ${LIB_DEB}
+DEBS = $(DEB) $(DBG_DEB) $(LIB_DEB)
 
-PERL_APIVER := `perl -MConfig -e 'print $$Config{debian_abi}//$$Config{version};'`
+all: $(DEB) $(DBG_DEB)
 
-all: ${DEB} ${DBG_DEB}
+$(BUILDDIR):
+	rm -rf $@ $@.tmp
+	cp -a src $@.tmp
+	cp -a debian $@.tmp/
+	echo "git clone git://git.proxmox.com/git/pve-cluster.git\\ngit checkout $(GITVERSION)" > $@.tmp/debian/SOURCE
+	mv $@.tmp $@
 
-cpgtest: cpgtest.c
-	gcc -Wall cpgtest.c $(shell pkg-config --cflags --libs libcpg libqb) -o cpgtest
+dsc:
+	rm -rf $(BUILDDIR) $(DSC)
+	$(MAKE) $(DSC)
+	lintian $(DSC)
 
-.PHONY: dinstall
-dinstall: ${DEB} ${LIB_DEB}
-	dpkg -i $^
+$(DSC): $(BUILDDIR)
+	cd $(BUILDDIR); dpkg-buildpackage -S -us -uc -d
 
 .PHONY: deb
-deb ${DBG_DEB} ${LIB_DEB}: ${DEB}
-${DEB}:
-	rm -f *.deb
-	rm -rf build
-	cp -a data build
-	cp -a debian build/debian
-	echo "git clone git://git.proxmox.com/git/pve-cluster.git\\ngit checkout ${GITVERSION}" > build/debian/SOURCE
-	cd build; dpkg-buildpackage -rfakeroot -b -us -uc
-	lintian ${DEB}
+deb $(DBG_DEB) $(LIB_DEB): $(DEB)
+$(DEB): $(BUILDDIR)
+	cd $(BUILDDIR); dpkg-buildpackage -b -us -uc
+	lintian $(DEB)
 
+sbuild: $(DSC)
+	sbuild $(DSC)
+
+.PHONY: dinstall
+dinstall: $(DEB) $(LIB_DEB)
+	dpkg -i $^
 
 .PHONY: upload
-upload: ${DEBS}
-	tar cf - ${DEBS} | ssh -X repoman@repo.proxmox.com -- upload --product pve --dist bullseye --arch ${DEB_BUILD_ARCH}
+upload: UPLOAD_DIST ?= $(DEB_DISTRIBUTION)
+upload: $(DEBS)
+	tar cf - $(DEBS) | ssh -X repoman@repo.proxmox.com -- upload --product pve --dist $(UPLOAD_DIST) --arch $(DEB_BUILD_ARCH)
 
 .PHONY: clean
 clean:
-	rm -rf *~ build *.deb *.changes *.dsc *.buildinfo
+	rm -rf $(PACKAGE)-[0-9]*/ *.deb *.dsc *.changes *.buildinfo *.build  *.tar.*

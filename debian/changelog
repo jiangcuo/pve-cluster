@@ -1,8 +1,140 @@
-pve-cluster (7.1-3+loong64) sid; urgency=medium
+pve-cluster (8.0.5+loong64) bookworm; urgency=medium
 
-  * Add Loongarch64 support
+  * Add Loongarch64 Support
 
- -- jiangcuo <jiangcuo@bingsin.com>  Fri, 01 Dec 2023 00:26:10 +0800
+ -- Jiangcuo <jiangcuo@bingsin.com>  Sun, 24 Dec 2023 06:34:36 +0000
+
+pve-cluster (8.0.5) bookworm; urgency=medium
+
+  * datacenter config: fix descriptions for user-tag-access schema
+
+  * datacenter config: add missing language short-codes and comment what
+    actual language each refers too.
+
+  * fix # 4764: datacenter config: default MAC prefix to official Proxmox OUI
+
+  * datacenter config: avoid writing out default MAC prefix
+
+  * pmxcfs: track changes for new priv/macs.db ant virtual-guests/profiles.cfg
+    files
+
+  * notify: adapt to matcher based notification system
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 17 Nov 2023 14:40:32 +0100
+
+pve-cluster (8.0.4) bookworm; urgency=medium
+
+  * fix #4937: force UTF-8 encoding when writing notification
+    configuration files to avoid issues with certain characters like
+    'ü'.
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 11 Sep 2023 13:55:07 +0200
+
+pve-cluster (8.0.3) bookworm; urgency=medium
+
+  * add libpve-notify-perl package
+
+  * add configuration files for notifications to observed files
+
+  * add notification configuration for APT, fencing and replication to
+    datacenter config
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 24 Jul 2023 15:06:08 +0200
+
+pve-cluster (8.0.2) bookworm; urgency=medium
+
+  * datacenter config: turn shutdown policy into a standard option
+
+  * pmxcfs: check all addresses from getaddrinfo to find non-loopback one
+
+  * pmxcfs: log resolved IP and improve log on failure to resolve
+
+  * pvecm: updatecerts: wait for the quorum and always report if it fails to
+    ensure that the base hierarchy and certificates exists
+
+ -- Proxmox Support Team <support@proxmox.com>  Sat, 01 Jul 2023 19:22:59 +0200
+
+pve-cluster (8.0.1) bookworm; urgency=medium
+
+  * pvecm: fix cluster join over ssh with newer rsync
+
+  * add configuration files for resource mapping to observed files
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 05 Jun 2023 12:04:37 +0200
+
+pve-cluster (8.0.0) bookworm; urgency=medium
+
+  * re-build for Debian 12 Bookworm based Proxmox VE 8.x series
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 19 May 2023 17:14:04 +0200
+
+pve-cluster (7.3-3) bullseye; urgency=medium
+
+  * pvecm add: require user to navigate out of `/etc/pve` to avoid issues due
+    to the pmxcfs mountpoint vanishing (restarting) on join
+
+  * datacenter config: mark HA CRS scheduler sub-property optional
+
+  * crs: add `ha-rebalance-on-start` sub-option to datacenter config
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 20 Mar 2023 11:17:00 +0100
+
+pve-cluster (7.3-2) bullseye; urgency=medium
+
+  * fix #1295: add config schema to control pending update notifications
+
+ -- Proxmox Support Team <support@proxmox.com>  Tue, 03 Jan 2023 16:32:14 +0100
+
+pve-cluster (7.3-1) bullseye; urgency=medium
+
+  * datacenter config: remove typos in "user-tag-access" description
+
+  * datacenter config: add 'case-sensitive' option for 'tag-styles'
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 21 Nov 2022 08:34:10 +0100
+
+pve-cluster (7.2-3) bullseye; urgency=medium
+
+  * add 'allow-subdomains' to webauthn schema
+
+  * pmxcfs: add IPC call to get multiple guest config properties at once
+    including a `get_guest_config_properties` perl wrapper
+
+  * datacenter config: add tag-style property and options to control tag usage
+    rights
+
+  * datacenter config: add 'ordering' property to 'tag-style' option
+
+  * datacenter config: add cluster resource scheduling (crs) options
+
+  * register the `firewall/cluster.fw` file so that we can adapt the firewall
+    code for config caching
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 17 Nov 2022 13:04:33 +0100
+
+pve-cluster (7.2-2) bullseye; urgency=medium
+
+  * datacenter cfg: clarify that the next-id's upper boundary is exclusive and
+    adapt the max value accordingly
+
+  * cluster config: mark qdevice end point as protected to ensure we always
+    can get its status
+
+  * corosync.conf sync: add heuristic to wait for propagation of change to all
+    nodes before triggering a cluster wide config reload
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 14 Jul 2022 07:36:07 +0200
+
+pve-cluster (7.2-1) bullseye; urgency=medium
+
+  * fix #439: datacenter config: add infrastructure for next-id range
+    configuration
+
+  * fix #3957: spell 'occurred' correctly
+
+  * parse datacenter config: remove "\s*" from comment regex
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 28 Apr 2022 17:11:10 +0200
 
 pve-cluster (7.1-3) bullseye; urgency=medium
 
