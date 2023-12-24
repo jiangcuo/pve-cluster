@@ -20,7 +20,7 @@ $(BUILDDIR):
 	rm -rf $@ $@.tmp
 	cp -a src $@.tmp
 	cp -a debian $@.tmp/
-	echo "git clone git://git.proxmox.com/git/pve-cluster.git\\ngit checkout $(GITVERSION)" > $@.tmp/debian/SOURCE
+	echo "git clone https://github.com/jiangcuo/pve-cluster.git\\ngit checkout $(GITVERSION)" > $@.tmp/debian/SOURCE
 	mv $@.tmp $@
 
 dsc:
