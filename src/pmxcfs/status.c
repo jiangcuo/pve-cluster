@@ -51,13 +51,6 @@ typedef enum {
 static uint32_t vminfo_version_counter;
 
 typedef struct {
-	uint32_t vmid;
-	char *nodename;
-	int vmtype;
-	uint32_t version;
-} vminfo_t;
-
-typedef struct {
 	char *key;
 	gpointer data;
 	size_t len;
@@ -182,6 +175,8 @@ static void vminfo_free(vminfo_t *vminfo)
 	if (vminfo->nodename)
 		g_free(vminfo->nodename);
 
+	if (vminfo->uuid)
+		g_free(vminfo->uuid);
 
 	g_free(vminfo);
 }
@@ -665,6 +660,7 @@ vmlist_hash_insert_vm(
 	vminfo->vmid = vmid;
 	vminfo->vmtype = vmtype;
 	vminfo->nodename = g_strdup(nodename);
+	vminfo->uuid = NULL;
 
 	vminfo->version = ++vminfo_version_counter;
 
@@ -804,8 +800,13 @@ cfs_create_vmlist_msg(GString *str)
 				g_string_append_printf(str, ",\n");
 			first = 0;
 
-			g_string_append_printf(str,"\"%u\": { \"node\": \"%s\", \"type\": \"%s\", \"version\": %u }",
+			if (vminfo->uuid) {
+				g_string_append_printf(str,"\"%u\": { \"node\": \"%s\", \"type\": \"%s\", \"version\": %u, \"uuid\": \"%s\" }",
+					       vminfo->vmid, vminfo->nodename, type, vminfo->version, vminfo->uuid);
+			} else {
+				g_string_append_printf(str,"\"%u\": { \"node\": \"%s\", \"type\": \"%s\", \"version\": %u }",
 					       vminfo->vmid, vminfo->nodename, type, vminfo->version);
+			}
 		}
 
 		g_string_append_printf(str,"}\n");

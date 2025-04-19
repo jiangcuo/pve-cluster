@@ -18,6 +18,8 @@
 
 */
 
+#define G_LOG_DOMAIN "memdb"
+
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif /* HAVE_CONFIG_H */
@@ -34,6 +36,8 @@
 #include <string.h>
 #include <errno.h>
 #include <glib.h>
+#include <sys/statvfs.h>
+#include <linux/limits.h>
 
 #include "cfs-utils.h"
 #include "memdb.h"
@@ -346,8 +350,59 @@ vmlist_add_dir(
 		if (!name_is_vm_config(node_te->name, &vmid))
 			continue;
 
+		char *uuid = NULL;
+		if (node_te->data.value && node_te->size > 0) {
+			const char *data = node_te->data.value;
+			const char *uuid_line = NULL;
+			char **lines = g_strsplit(data, "\n", -1);
+			for (int i = 0; lines[i] != NULL; i++) {
+				if (g_str_has_prefix(lines[i], "uuid:")) {
+					uuid_line = lines[i] + 5;
+					while (*uuid_line && g_ascii_isspace(*uuid_line))
+						uuid_line++;
+					if (*uuid_line)
+						uuid = g_strdup(uuid_line);
+					break;
+				}
+			}
+			g_strfreev(lines);
+		}
+
+		if (!uuid && node_te->inode) {
+			char vm_path[PATH_MAX];
+			snprintf(vm_path, sizeof(vm_path), "nodes/%s/%s/%u.conf",
+				 nodename, vmtype == VMTYPE_QEMU ? "qemu-server" :
+					 (vmtype == VMTYPE_LXC ? "lxc" : "openvz"), vmid);
+
+			gpointer conf_data = NULL;
+			int res = memdb_read(memdb, vm_path, &conf_data);
+			if (res > 0 && conf_data) {
+				char **lines = g_strsplit(conf_data, "\n", -1);
+				for (int i = 0; lines[i] != NULL; i++) {
+					if (g_str_has_prefix(lines[i], "uuid:")) {
+						const char *uuid_line = lines[i] + 5;
+						while (*uuid_line && g_ascii_isspace(*uuid_line))
+							uuid_line++;
+						if (*uuid_line)
+							uuid = g_strdup(uuid_line);
+						break;
+					}
+				}
+				g_strfreev(lines);
+				g_free(conf_data);
+			}
+		}
+
 		if (!vmlist_hash_insert_vm(vmlist, vmtype, vmid, nodename, FALSE))
 			ret = FALSE;
+		if (uuid) {
+			vminfo_t *vminfo = g_hash_table_lookup(vmlist, &vmid);
+			if (vminfo) {
+				vminfo->uuid = uuid;
+			} else {
+				g_free(uuid);
+			}
+		}
 	}
 
 	return ret;
