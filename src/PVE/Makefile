@@ -1,12 +1,11 @@
-DESTDIR=
+ESTDIR=
 PERL5DIR=$(DESTDIR)/usr/share/perl5
 PVEDIR=$(PERL5DIR)/PVE
 MAN=$(DESTDIR)/usr/share/man
 BASHCOMPLETION=$(DESTDIR)/usr/share/bash-completion/completions
 ZSHCOMPLETION=$(DESTDIR)/usr/share/zsh/vendor-completions
 
-PERL_VENDORARCH=$(shell perl -MConfig -e 'print $$Config{vendorarch};')
-PVE_VENDORARCH=$(DESTDIR)/$(PERL_VENDORARCH)/auto/PVE/IPCC
+PVE_VENDORARCH=$(DESTDIR)/usr/lib/$(DEB_HOST_MULTIARCH)/perl5/5.40/auto/PVE/IPCC
 
 PERL_DOC_INC_DIRS:=..
 
@@ -41,11 +40,20 @@ Cluster/IPCConst.pm:
 check: IPCC.so Cluster/IPCConst.pm
 	perl $(PERL_DOC_INC) -T -e "use PVE::CLI::pvecm; PVE::CLI::pvecm->verify_api();"
 
-CC=gcc
+# Support cross-compilation
+CC ?= gcc
+PKG_CONFIG ?= pkg-config
+
+# If DEB_HOST_GNU_TYPE is set (cross-compilation), use cross-compiler
+ifdef DEB_HOST_GNU_TYPE
+    CC = $(DEB_HOST_GNU_TYPE)-gcc
+    PKG_CONFIG = env PKG_CONFIG_LIBDIR=/usr/lib/$(DEB_HOST_GNU_TYPE)/pkgconfig:/usr/share/pkgconfig pkg-config
+endif
+
 CFLAGS += -fPIC -Wl,-z,relro -Wall -Werror -Wno-strict-aliasing -g -O2 -shared
-CFLAGS += $(shell pkg-config --cflags libqb)
+CFLAGS += $(shell $(PKG_CONFIG) --cflags libqb)
 CFLAGS += $(shell perl -MExtUtils::Embed -e perl_inc)
-LDFLAGS = $(shell pkg-config --libs libqb)
+LDFLAGS = $(shell $(PKG_CONFIG) --libs libqb)
 
 .c.o:
 	$(CC) $(CFLAGS) -c -o $@ $<

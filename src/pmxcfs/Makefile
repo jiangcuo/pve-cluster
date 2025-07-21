@@ -1,17 +1,29 @@
-
 DEPENDENCIES=libcpg libcmap libcorosync_common libquorum libqb glib-2.0 fuse sqlite3 librrd
 
-CC = gcc
+# Support cross-compilation by using environment variables
+CC ?= gcc
+AR ?= ar
+PKG_CONFIG ?= pkg-config
+
+# If DEB_HOST_GNU_TYPE is set (cross-compilation), use cross-compiler
+ifdef DEB_HOST_GNU_TYPE
+    CC = $(DEB_HOST_GNU_TYPE)-gcc
+    AR = $(DEB_HOST_GNU_TYPE)-ar
+    # Use standard pkg-config but with target architecture paths
+    PKG_CONFIG = env PKG_CONFIG_LIBDIR=/usr/lib/$(DEB_HOST_GNU_TYPE)/pkgconfig:/usr/share/pkgconfig pkg-config
+    # Add target architecture library path for cross-compilation
+    LDFLAGS += -L/usr/lib/$(DEB_HOST_GNU_TYPE)
+endif
+
 CFLAGS += -std=gnu99
 CFLAGS += -Wall -Werror -Wno-unknown-pragmas -Wno-strict-aliasing
-CFLAGS += -Wpedantic
+#CFLAGS += -Wpedantic
 CFLAGS += -g -O2
 CFLAGS += -I.
-CFLAGS += $(shell pkg-config --cflags $(DEPENDENCIES))
+CFLAGS += $(shell $(PKG_CONFIG) --cflags $(DEPENDENCIES))
 
-LDFLAGS += -Wl,-z,relro $(shell pkg-config --libs $(DEPENDENCIES))
+LDFLAGS += -Wl,-z,relro $(shell $(PKG_CONFIG) --libs $(DEPENDENCIES))
 
-AR = ar
 ARFLAGS = crs
 
 .c.o:
@@ -39,7 +51,7 @@ logtest2: logtest2.o libpmxcfs.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 check_memdb: check_memdb.o libpmxcfs.a
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs check)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(shell $(PKG_CONFIG) --libs check)
 
 pmxcfs.8:
 

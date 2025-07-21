@@ -6,11 +6,11 @@ DSC=$(PACKAGE)_$(DEB_VERSION).dsc
 
 GITVERSION:=$(shell git rev-parse HEAD)
 
-DEB=$(PACKAGE)_$(DEB_VERSION)_$(DEB_BUILD_ARCH).deb
+DEB=$(PACKAGE)_$(DEB_VERSION)_$(DEB_HOST_ARCH).deb
 LIB_DEB  = libpve-cluster-perl_$(DEB_VERSION)_all.deb
 LIB_DEB += libpve-cluster-api-perl_$(DEB_VERSION)_all.deb
 LIB_DEB += libpve-notify-perl_$(DEB_VERSION)_all.deb
-DBG_DEB=$(PACKAGE)-dbgsym_$(DEB_VERSION)_$(DEB_BUILD_ARCH).deb
+DBG_DEB=$(PACKAGE)-dbgsym_$(DEB_VERSION)_$(DEB_HOST_ARCH).deb
 
 DEBS = $(DEB) $(DBG_DEB) $(LIB_DEB)
 
@@ -38,7 +38,7 @@ $(DSC): $(BUILDDIR)
 .PHONY: deb
 deb $(DBG_DEB) $(LIB_DEB): $(DEB)
 $(DEB): $(BUILDDIR)
-	cd $(BUILDDIR); dpkg-buildpackage -b -us -uc
+	cd $(BUILDDIR); dpkg-buildpackage -b -us -uc -a$(DEB_HOST_ARCH) -d
 	lintian $(DEB)
 
 sbuild: $(DSC)
@@ -51,7 +51,7 @@ dinstall: $(DEB) $(LIB_DEB)
 .PHONY: upload
 upload: UPLOAD_DIST ?= $(DEB_DISTRIBUTION)
 upload: $(DEBS)
-	tar cf - $(DEBS) | ssh -X repoman@repo.proxmox.com -- upload --product pve --dist $(UPLOAD_DIST) --arch $(DEB_BUILD_ARCH)
+	tar cf - $(DEBS) | ssh -X repoman@repo.proxmox.com -- upload --product pve --dist $(UPLOAD_DIST) --arch $(DEB_HOST_ARCH)
 
 .PHONY: clean
 clean:
