@@ -13,6 +13,7 @@ use PVE::Cluster;
 use PVE::APIClient::LWP;
 use PVE::Corosync;
 use PVE::Cluster::Setup;
+use JSON;
 
 use IO::Socket::UNIX;
 
@@ -59,11 +60,56 @@ __PACKAGE__->register_method({
             { name => 'join' },
             { name => 'qdevice' },
             { name => 'apiversion' },
+            { name => 'vmlist' },
         ];
 
         return $result;
     },
 });
+
+__PACKAGE__->register_method({
+    name => 'vmlist',
+    path => 'vmlist',
+    method => 'GET',
+    description => "VM list.",
+    permissions => {
+	check => ['perm', '/', [ 'Sys.Audit' ]],
+    },
+	protected => 1,
+    parameters => {
+	additionalProperties => 0,
+	properties => {},
+    },
+    returns => {
+	type => 'object',
+    },
+    code => sub {
+	my ($param) = @_;
+    my $rpcenv = PVE::RPCEnvironment::get();
+    my $authuser = $rpcenv->get_user();
+    if ($authuser ne 'root@pam' && !PVE::AccessControl::verify_root_api_key($authuser)) {
+        die "only root\@pam can access this API\n";
+    }
+	my $vmlist_content;
+	my $vmlist_data;
+	my $vmlist_path = '/etc/pve/.vmlist';
+
+	if (open(my $fh, '<', $vmlist_path)) {
+		local $/;
+		$vmlist_content = <$fh>;
+		close($fh);
+		eval {
+			$vmlist_data = decode_json($vmlist_content);
+		};
+		if ($@) {
+			warn "cannot parse vmlist: $@";
+		}
+	} else {
+		warn "cannot open vmlist: $!";
+	}
+
+	return $vmlist_data;
+    }});
 
 __PACKAGE__->register_method({
     name => 'join_api_version',
