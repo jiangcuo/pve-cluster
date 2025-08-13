@@ -368,14 +368,14 @@ static gboolean vmlist_add_dir(
 
         if (!vmlist_hash_insert_vm(vmlist, vmtype, vmid, nodename, FALSE)) {
             ret = FALSE;
-		if (uuid) {
-			vminfo_t *vminfo = g_hash_table_lookup(vmlist, &vmid);
-			if (vminfo) {
-				vminfo->uuid = uuid;
-			} else {
-				g_free(uuid);
-			}
-		}
+        }
+        if (uuid) {
+            vminfo_t *vminfo = g_hash_table_lookup(vmlist, &vmid);
+            if (vminfo) {
+                vminfo->uuid = uuid;
+            } else {
+                g_free(uuid);
+            }
         }
     }
 

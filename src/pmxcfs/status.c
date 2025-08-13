@@ -51,13 +51,6 @@ typedef enum {
 static uint32_t vminfo_version_counter;
 
 typedef struct {
-    uint32_t vmid;
-    char *nodename;
-    int vmtype;
-    uint32_t version;
-} vminfo_t;
-
-typedef struct {
     char *key;
     gpointer data;
     size_t len;
@@ -174,8 +167,10 @@ static void vminfo_free(vminfo_t *vminfo) {
     if (vminfo->nodename) {
         g_free(vminfo->nodename);
     }
-	if (vminfo->uuid)
-		g_free(vminfo->uuid);
+
+    if (vminfo->uuid) {
+        g_free(vminfo->uuid);
+    }
 
     g_free(vminfo);
 }
