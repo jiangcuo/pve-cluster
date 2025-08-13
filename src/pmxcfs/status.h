@@ -34,6 +34,14 @@
 
 #define CFS_MAX_STATUS_SIZE (32 * 1024)
 
+typedef struct {
+	uint32_t vmid;
+	char *nodename;
+	int vmtype;
+	uint32_t version;
+	char *uuid;
+} vminfo_t;
+
 typedef struct cfs_clnode cfs_clnode_t;
 typedef struct cfs_clinfo cfs_clinfo_t;
 
