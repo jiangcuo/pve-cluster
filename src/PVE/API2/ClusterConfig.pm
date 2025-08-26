@@ -71,7 +71,7 @@ __PACKAGE__->register_method({
     name => 'vmlist',
     path => 'vmlist',
     method => 'GET',
-    description => "VM list.",
+    description => "VM list with UUID support.",
     permissions => {
 	check => ['perm', '/', [ 'Sys.Audit' ]],
     },
@@ -81,7 +81,7 @@ __PACKAGE__->register_method({
 	properties => {},
     },
     returns => {
-	type => 'object',
+	type => 'array',
     },
     code => sub {
 	my ($param) = @_;
@@ -92,6 +92,7 @@ __PACKAGE__->register_method({
     }
 	my $vmlist_content;
 	my $vmlist_data;
+    my $vm_list = [];
 	my $vmlist_path = '/etc/pve/.vmlist';
 
 	if (open(my $fh, '<', $vmlist_path)) {
@@ -103,12 +104,47 @@ __PACKAGE__->register_method({
 		};
 		if ($@) {
 			warn "cannot parse vmlist: $@";
+			return $vm_list;
 		}
 	} else {
 		warn "cannot open vmlist: $!";
+		return $vm_list;
 	}
 
-	return $vmlist_data;
+
+	if ($vmlist_data && $vmlist_data->{ids}) {
+		for my $vmid (keys %{$vmlist_data->{ids}}) {
+			my $vm_info = $vmlist_data->{ids}->{$vmid};
+			next unless $vm_info->{node} && $vm_info->{type};
+			
+			my $vm_entry = {
+				vmid => int($vmid),
+				node => $vm_info->{node},
+				type => $vm_info->{type},
+				version => $vm_info->{version} || 0
+			};
+			
+			my $vm_type = $vm_info->{type} eq 'qemu' ? 'qemu-server' : $vm_info->{type};
+			my $config_path = "/etc/pve/nodes/$vm_info->{node}/$vm_type/$vmid.conf";
+			
+			if (open(my $conf_fh, '<', $config_path)) {
+				while (my $line = <$conf_fh>) {
+					chomp $line;
+					if ($line =~ /^uuid:\s*(.+)$/) {
+						my $uuid = $1;
+						$uuid =~ s/^\s+|\s+$//g;
+						$vm_entry->{uuid} = $uuid if $uuid;
+						last;
+					}
+				}
+				close($conf_fh);
+			}
+			
+			push @$vm_list, $vm_entry;
+		}
+	}
+
+	return $vm_list;
     }});
 
 __PACKAGE__->register_method({
