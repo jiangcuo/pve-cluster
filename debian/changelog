@@ -1,3 +1,9 @@
+pve-cluster (8.1.2-1) bookworm; urgency=medium
+
+  * Fix abi compatibility issue
+
+ -- Lierfang Support Team <it_support@lierfang.com>  Tue, 26 Aug 2025 10:00:00 +0800
+
 pve-cluster (8.1.2) bookworm; urgency=medium
 
   * status: handle new metrics update data to avoid issues on a upgrade of a

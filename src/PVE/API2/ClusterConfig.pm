@@ -71,7 +71,7 @@ __PACKAGE__->register_method({
     name => 'vmlist',
     path => 'vmlist',
     method => 'GET',
-    description => "VM list.",
+    description => "VM list with UUID support.",
     permissions => {
 	check => ['perm', '/', [ 'Sys.Audit' ]],
     },
@@ -81,7 +81,7 @@ __PACKAGE__->register_method({
 	properties => {},
     },
     returns => {
-	type => 'object',
+	type => 'array',
     },
     code => sub {
 	my ($param) = @_;
@@ -90,6 +90,8 @@ __PACKAGE__->register_method({
     if ($authuser ne 'root@pam' && !PVE::AccessControl::verify_root_api_key($authuser)) {
         die "only root\@pam can access this API\n";
     }
+	
+	# 读取原始vmlist
 	my $vmlist_content;
 	my $vmlist_data;
 	my $vmlist_path = '/etc/pve/.vmlist';
@@ -103,12 +105,53 @@ __PACKAGE__->register_method({
 		};
 		if ($@) {
 			warn "cannot parse vmlist: $@";
+			return {};
 		}
 	} else {
 		warn "cannot open vmlist: $!";
+		return {};
 	}
 
-	return $vmlist_data;
+	# 构建哈希对象输出，包含data数组
+	my $vm_list = [];
+
+	if ($vmlist_data && $vmlist_data->{ids}) {
+		for my $vmid (keys %{$vmlist_data->{ids}}) {
+			my $vm_info = $vmlist_data->{ids}->{$vmid};
+			next unless $vm_info->{node} && $vm_info->{type};
+			
+			# 构建VM信息对象
+			my $vm_entry = {
+				vmid => int($vmid),
+				node => $vm_info->{node},
+				type => $vm_info->{type},
+				version => $vm_info->{version} || 0
+			};
+			
+			# 尝试读取UUID
+			my $vm_type = $vm_info->{type} eq 'qemu' ? 'qemu-server' : $vm_info->{type};
+			my $config_path = "/etc/pve/nodes/$vm_info->{node}/$vm_type/$vmid.conf";
+			
+			if (open(my $conf_fh, '<', $config_path)) {
+				while (my $line = <$conf_fh>) {
+					chomp $line;
+					if ($line =~ /^uuid:\s*(.+)$/) {
+						my $uuid = $1;
+						$uuid =~ s/^\s+|\s+$//g;  # 去掉前后空格
+						$vm_entry->{uuid} = $uuid if $uuid;
+						last;
+					}
+				}
+				close($conf_fh);
+			}
+			
+			push @$vm_list, $vm_entry;
+		}
+	}
+
+	# 返回哈希对象
+	return 
+		$vm_list;
     }});
 
 __PACKAGE__->register_method({
