@@ -6,8 +6,10 @@ use warnings;
 use Digest::HMAC_SHA1;
 use Digest::SHA;
 use IO::File;
+use IO::Socket::SSL;
 use MIME::Base64;
 use Net::IP;
+use Net::SSLeay;
 use UUID;
 use POSIX qw(EEXIST);
 
@@ -651,11 +653,12 @@ sub gen_pve_vzdump_files {
 
 # join helpers
 
-sub assert_joinable {
-    my ($local_addr, $links, $force) = @_;
+# Returns the problems that prevent this node from joining a cluster.
+sub check_joinable {
+    my ($local_addr, $links) = @_;
 
-    my $errors = '';
-    my $error = sub { $errors .= "* $_[0]\n"; };
+    my $errors = [];
+    my $error = sub { push @$errors, $_[0] =~ s/\n+$//r; };
 
     if (-f $authfile) {
         $error->("authentication key '$authfile' already exists");
@@ -700,11 +703,29 @@ sub assert_joinable {
         $check_ip->($links->{$link}->{address}, "link$link");
     }
 
-    if ($errors) {
-        warn "detected the following error(s):\n$errors";
+    return $errors;
+}
+
+sub assert_joinable {
+    my ($local_addr, $links, $force) = @_;
+
+    my $errors = check_joinable($local_addr, $links);
+
+    if (scalar(@$errors)) {
+        warn "detected the following error(s):\n" . join('', map { "* $_\n" } @$errors);
         die "Check if node may join a cluster failed!\n" if !$force;
         warn "\nWARNING : detected error but forced to continue!\n\n";
     }
+}
+
+# prepare SSH for joining a cluster
+sub prepare_join {
+    setup_sshd_config();
+    setup_rootsshconfig();
+    setup_ssh_keys();
+
+    # make sure known_hosts is on local filesystem
+    ssh_unmerge_known_hosts();
 }
 
 sub join {
@@ -718,12 +739,7 @@ sub join {
     # check if we can join with the given parameters and current node state
     assert_joinable($local_ip_address, $links, $param->{force});
 
-    setup_sshd_config();
-    setup_rootsshconfig();
-    setup_ssh_keys();
-
-    # make sure known_hosts is on local filesystem
-    ssh_unmerge_known_hosts();
+    prepare_join();
 
     my $host = $param->{hostname};
     my $conn_args = {
@@ -841,6 +857,79 @@ sub finish_join {
     PVE::Tools::run_command(['systemctl', 'reload-or-restart', 'pvedaemon', 'pveproxy']);
 
     print "successfully added node '$nodename' to cluster.\n";
+}
+
+# Links of a node in the corosync configuration, as returned by extract_corosync_link_args.
+sub get_node_links_from_conf {
+    my ($corosync_conf, $nodename) = @_;
+
+    my $conf = PVE::Corosync::parse_conf(undef, $corosync_conf);
+    my $node = (PVE::Corosync::nodelist($conf) // {})->{$nodename}
+        or die "node '$nodename' not found in the cluster configuration\n";
+
+    my $links = {};
+    for my $link (0 .. PVE::Corosync::MAX_LINK_INDEX) {
+        my $address = $node->{"ring${link}_addr"} // next;
+        $links->{$link} = { address => $address };
+    }
+    return $links;
+}
+
+# Join a cluster with the configuration provided by a cluster node, which already added this
+# node to the cluster configuration. The counterpart of the cluster side remote node addition.
+sub accept_join {
+    my ($corosync_conf, $corosync_authkey) = @_;
+
+    my $nodename = PVE::INotify::nodename();
+
+    prepare_join();
+
+    print "Got cluster configuration, finishing setup locally\n";
+    finish_join($nodename, $corosync_conf, $corosync_authkey);
+}
+
+# Get the SHA256 fingerprint of the certificate of a remote API, without verifying it.
+sub get_remote_fingerprint {
+    my ($host, $port) = @_;
+
+    my $socket = IO::Socket::SSL->new(
+        PeerHost => $host,
+        PeerPort => $port // 8006,
+        SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE(),
+        Timeout => 10,
+    );
+    if (!$socket) {
+        # connection errors are only reported as generic socket error
+        my $err = $IO::Socket::SSL::SSL_ERROR;
+        $err = "$!" if !$err || $err =~ m/configuration failed/;
+        die "unable to connect to '$host' - $err\n";
+    }
+
+    my $cert = $socket->peer_certificate() or die "no certificate received from '$host'\n";
+    my $fingerprint = Net::SSLeay::X509_get_fingerprint($cert, 'sha256');
+    $socket->close();
+
+    die "unable to get the certificate fingerprint of '$host'\n" if !$fingerprint;
+    return $fingerprint;
+}
+
+# Connect to the API of a remote node as root, only trusting the given certificate fingerprints.
+sub remote_connect {
+    my ($host, $password, $fingerprints) = @_;
+
+    my $conn = PVE::APIClient::LWP->new(
+        username => 'root@pam',
+        password => $password,
+        cookie_name => 'PVEAuthCookie',
+        protocol => 'https',
+        host => $host,
+        port => 8006,
+        cached_fingerprints => { map { uc($_) => 1 } @$fingerprints },
+        timeout => 30,
+    );
+    $conn->login();
+
+    return $conn;
 }
 
 sub generate_local_files {

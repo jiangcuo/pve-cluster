@@ -14,6 +14,7 @@ use PVE::APIClient::LWP;
 use PVE::Corosync;
 use PVE::Cluster::Setup;
 use JSON;
+use MIME::Base64;
 
 use IO::Socket::UNIX;
 
@@ -61,6 +62,10 @@ __PACKAGE__->register_method({
             { name => 'qdevice' },
             { name => 'apiversion' },
 	    { name => 'vmlist' },
+            { name => 'joinable' },
+            { name => 'accept-join' },
+            { name => 'check-node' },
+            { name => 'add-node' },
         ];
 
         return $result;
@@ -738,6 +743,427 @@ __PACKAGE__->register_method({
         };
 
         return $rpcenv->fork_worker('clusterjoin', undef, $authuser, $worker);
+    },
+});
+
+# Adding a node from the cluster side: a cluster node checks the new node ('check-node'), adds it to
+# the corosync configuration and sends the configuration to the new node ('add-node'), which then
+# finishes joining ('joinable' and 'accept-join' on the new node).
+
+my $remote_error = sub {
+    my ($err) = @_;
+
+    if (ref($err) && $err->isa('PVE::APIClient::Exception')) {
+        my $msg = $err->{msg} // "$err";
+        chomp $msg;
+        $msg = "authentication failure" if ($err->{code} // 0) == 401;
+        my $errors = $err->{errors} // {};
+        $msg .= join('', map { "\n$errors->{$_}" } sort keys %$errors);
+        return "$msg\n";
+    }
+    return $err;
+};
+
+my $cluster_link_ids = sub {
+    my ($nodelist) = @_;
+
+    # all nodes have the same links, see PVE::Corosync::verify_conf
+    my $node = (values %$nodelist)[0] // {};
+    my $ids = [];
+    for my $opt (keys %$node) {
+        my ($type, $id) = PVE::Corosync::parse_link_entry($opt);
+        push @$ids, int($id) if defined($type);
+    }
+    return [sort { $a <=> $b } @$ids];
+};
+
+my $remote_node_properties = {
+    address => {
+        type => 'string',
+        format => 'address',
+        description => "IP address or hostname of the node to add.",
+    },
+    password => {
+        type => 'string',
+        description => "Superuser (root) password of the node to add.",
+        maxLength => 128,
+    },
+    fingerprint => get_standard_option('fingerprint-sha256'),
+};
+
+__PACKAGE__->register_method({
+    name => 'joinable',
+    path => 'joinable',
+    method => 'GET',
+    protected => 1,
+    description => "Check if this node can be added to a cluster by a cluster node."
+        . " This call is for internal use.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {},
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            nodename => get_standard_option('pve-node'),
+            ip => {
+                type => 'string',
+                optional => 1,
+            },
+            apiversion => {
+                type => 'integer',
+                description => 'The JOIN_API_VERSION of this node.',
+            },
+            errors => {
+                type => 'array',
+                items => { type => 'string' },
+                description => 'Problems preventing this node from joining a cluster.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $nodename = PVE::INotify::nodename();
+        my $ip = eval { scalar(PVE::Cluster::remote_node_ip($nodename)) };
+
+        return {
+            nodename => $nodename,
+            defined($ip) ? (ip => $ip) : (),
+            apiversion => PVE::Cluster::Setup::JOIN_API_VERSION,
+            errors => PVE::Cluster::Setup::check_joinable($ip, {}),
+        };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'accept_join',
+    path => 'accept-join',
+    method => 'POST',
+    protected => 1,
+    description => "Join a cluster with the configuration of a cluster node, which already added"
+        . " this node. This call is for internal use.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            corosync_conf => {
+                type => 'string',
+                description => 'The corosync configuration of the cluster.',
+                maxLength => 128 * 1024,
+            },
+            corosync_authkey => {
+                type => 'string',
+                description => 'The base64 encoded corosync authentication key.',
+                maxLength => 64 * 1024,
+            },
+            apiversion => {
+                type => 'integer',
+                description => 'The JOIN_API_VERSION of the cluster node.',
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        PVE::Cluster::Setup::assert_we_can_join_cluster_version($param->{apiversion});
+
+        my $nodename = PVE::INotify::nodename();
+        my $corosync_conf = $param->{corosync_conf};
+        my $corosync_authkey = decode_base64($param->{corosync_authkey});
+        die "invalid corosync authentication key\n" if !length($corosync_authkey);
+
+        # check before doing anything, so that the cluster node can revert adding this node
+        my $links = PVE::Cluster::Setup::get_node_links_from_conf($corosync_conf, $nodename);
+        my $ip = eval { scalar(PVE::Cluster::remote_node_ip($nodename)) };
+        my $errors = PVE::Cluster::Setup::check_joinable($ip, $links);
+        die "node cannot join the cluster:\n" . join('', map { "* $_\n" } @$errors)
+            if scalar(@$errors);
+
+        my $worker = sub {
+            STDOUT->autoflush();
+            PVE::Tools::lock_file(
+                $local_cluster_lock,
+                10,
+                \&PVE::Cluster::Setup::accept_join,
+                $corosync_conf,
+                $corosync_authkey,
+            );
+            die $@ if $@;
+        };
+
+        return $rpcenv->fork_worker('clusterjoin', undef, $authuser, $worker);
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'check_node',
+    path => 'check-node',
+    method => 'POST',
+    protected => 1,
+    description => "Check if a node can be added to the cluster. Without fingerprint, only the"
+        . " certificate fingerprint of the node is returned, which must be confirmed before"
+        . " sending the password.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            address => $remote_node_properties->{address},
+            password => { $remote_node_properties->{password}->%*, optional => 1 },
+            fingerprint => get_standard_option('fingerprint-sha256', { optional => 1 }),
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            fingerprint => get_standard_option('fingerprint-sha256'),
+            nodename => get_standard_option('pve-node', { optional => 1 }),
+            ip => {
+                type => 'string',
+                optional => 1,
+            },
+            version => {
+                type => 'string',
+                optional => 1,
+            },
+            errors => {
+                type => 'array',
+                items => { type => 'string' },
+                optional => 1,
+            },
+            addresses => {
+                type => 'array',
+                items => {
+                    type => 'object',
+                    properties => {
+                        iface => { type => 'string' },
+                        address => { type => 'string' },
+                    },
+                },
+                optional => 1,
+            },
+            links => {
+                type => 'array',
+                items => { type => 'integer' },
+                description => 'The corosync links of the cluster.',
+                optional => 1,
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
+        die "this node is not in a cluster\n" if !($conf && $conf->{main});
+
+        my $address = $param->{address};
+        my $fingerprint = $param->{fingerprint};
+        if (!$fingerprint) {
+            return { fingerprint => PVE::Cluster::Setup::get_remote_fingerprint($address) };
+        }
+
+        die "password is required\n" if !defined($param->{password});
+
+        my ($conn, $info);
+        eval {
+            $conn = PVE::Cluster::Setup::remote_connect(
+                $address, $param->{password}, [$fingerprint],
+            );
+            $info = $conn->get('/cluster/config/joinable');
+        };
+        if (my $err = $@) {
+            die "node does not support being added by a cluster node, please upgrade it\n"
+                if ref($err) && ($err->{code} // 0) == 501;
+            die $remote_error->($err);
+        }
+
+        my $nodename = $info->{nodename};
+        my $errors = [$info->{errors}->@*];
+
+        my $nodelist = PVE::Corosync::nodelist($conf) // {};
+        push @$errors, "a node named '$nodename' is already part of the cluster"
+            if $nodelist->{$nodename};
+
+        eval { PVE::Cluster::Setup::assert_node_can_join_our_version($info->{apiversion}) };
+        push @$errors, $@ =~ s/\n+$//r if $@;
+
+        my $version = eval { $conn->get('/version') } // {};
+
+        my $addresses = [];
+        my $interfaces = eval { $conn->get("/nodes/$nodename/network") } // [];
+        for my $iface (sort { $a->{iface} cmp $b->{iface} } @$interfaces) {
+            for my $key ('address', 'address6') {
+                my $addr = $iface->{$key} // next;
+                push @$addresses, { iface => $iface->{iface}, address => $addr };
+            }
+        }
+
+        return {
+            fingerprint => $fingerprint,
+            nodename => $nodename,
+            defined($info->{ip}) ? (ip => $info->{ip}) : (),
+            defined($version->{version}) ? (version => $version->{version}) : (),
+            errors => $errors,
+            addresses => $addresses,
+            links => $cluster_link_ids->($nodelist),
+        };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'add_node',
+    path => 'add-node',
+    method => 'POST',
+    protected => 1,
+    description => "Add a node to the cluster. The node must not be part of a cluster and must"
+        . " not contain guests. If no links are given, the IP of the node's hostname is used on"
+        . " a single link cluster.",
+    parameters => {
+        additionalProperties => 0,
+        properties => PVE::Corosync::add_corosync_link_properties({
+            $remote_node_properties->%*,
+            nodeid => get_standard_option('corosync-nodeid'),
+            votes => {
+                type => 'integer',
+                description => "Number of votes for this node",
+                minimum => 0,
+                optional => 1,
+            },
+        }),
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        my $address = $param->{address};
+        my $password = $param->{password};
+        my $fingerprint = $param->{fingerprint};
+
+        my $worker = sub {
+            STDOUT->autoflush();
+
+            print "Establishing API connection with '$address'\n";
+            my ($conn, $info);
+            eval {
+                $conn = PVE::Cluster::Setup::remote_connect($address, $password, [$fingerprint]);
+                $info = $conn->get('/cluster/config/joinable');
+            };
+            die $remote_error->($@) if $@;
+
+            my $nodename = $info->{nodename};
+            print "Adding node '$nodename'\n";
+
+            die "node '$nodename' cannot join a cluster:\n"
+                . join('', map { "* $_\n" } $info->{errors}->@*)
+                if scalar($info->{errors}->@*);
+
+            my $args = {
+                node => $nodename,
+                apiversion => $info->{apiversion},
+            };
+            $args->{nodeid} = $param->{nodeid} if $param->{nodeid};
+            $args->{votes} = $param->{votes} if defined($param->{votes});
+            my $links = PVE::Corosync::extract_corosync_link_args($param);
+            for my $link (keys %$links) {
+                $args->{"link$link"} = PVE::Corosync::print_corosync_link($links->{$link});
+            }
+            if (!%$links) {
+                die "no links given and node '$nodename' has no IP to fall back to\n"
+                    if !$info->{ip};
+                print "No cluster network links passed explicitly, fallback to the node's IP"
+                    . " '$info->{ip}'\n";
+                $args->{new_node_ip} = $info->{ip};
+            }
+
+            my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
+            my $node_count = scalar(keys %{ PVE::Corosync::nodelist($conf) // {} });
+
+            print "Adding node '$nodename' to the cluster configuration\n";
+            my $res = __PACKAGE__->addnode($args);
+            warn "cluster: $_\n" for ($res->{warnings} // [])->@*;
+
+            print "Sending the cluster configuration to '$nodename'\n";
+            my $upid = eval {
+                $conn->post(
+                    '/cluster/config/accept-join',
+                    {
+                        corosync_conf => $res->{corosync_conf},
+                        corosync_authkey => encode_base64($res->{corosync_authkey}, ''),
+                        apiversion => PVE::Cluster::Setup::JOIN_API_VERSION,
+                    },
+                );
+            };
+            if (my $err = $@) {
+                warn "node '$nodename' did not accept the cluster configuration, reverting\n";
+                eval {
+                    # a single node cluster lost quorum by adding the node
+                    if ($node_count == 1 && !PVE::Cluster::check_cfs_quorum(1)) {
+                        PVE::Tools::run_command(['corosync-quorumtool', '-e', '1']);
+                        for (1 .. 10) {
+                            last if PVE::Cluster::check_cfs_quorum(1);
+                            sleep(1);
+                        }
+                    }
+                    __PACKAGE__->delnode({ node => $nodename });
+                };
+                warn "removing node '$nodename' from the cluster configuration failed - $@" if $@;
+                die $remote_error->($err);
+            }
+
+            print "Node '$nodename' is joining the cluster\n";
+
+            # The node restarts its cluster services and gets a new certificate signed by the
+            # cluster CA while joining, reconnect and also trust the new certificate then.
+            my $reconnect = sub {
+                my $fingerprints = [$fingerprint];
+                if (my $new = eval { PVE::Cluster::get_node_fingerprint($nodename) }) {
+                    push @$fingerprints, $new;
+                }
+                $conn = PVE::Cluster::Setup::remote_connect($address, $password, $fingerprints);
+            };
+
+            my $deadline = time() + 15 * 60;
+            my $start = 0;
+            my $status;
+            while (1) {
+                my $log;
+                eval {
+                    $status = $conn->get("/nodes/$nodename/tasks/$upid/status");
+                    $log = $conn->get(
+                        "/nodes/$nodename/tasks/$upid/log",
+                        { start => $start, limit => 500 },
+                    );
+                };
+                if (my $err = $@) {
+                    die "lost connection to '$nodename' - " . $remote_error->($err)
+                        if time() > $deadline;
+                    sleep(2);
+                    eval { $reconnect->() };
+                    next;
+                }
+
+                for my $line (@$log) {
+                    print "$nodename: $line->{t}\n";
+                    $start = $line->{n};
+                }
+                last if $status->{status} ne 'running';
+
+                die "timeout waiting for '$nodename' to join the cluster\n" if time() > $deadline;
+                sleep(1);
+            }
+
+            my $exitstatus = $status->{exitstatus} // 'unknown';
+            die "joining the cluster failed on '$nodename': $exitstatus\n" if $exitstatus ne 'OK';
+
+            print "Successfully added node '$nodename' to the cluster\n";
+        };
+
+        return $rpcenv->fork_worker('clusteradd', undef, $authuser, $worker);
     },
 });
 
