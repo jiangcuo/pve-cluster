@@ -50,6 +50,7 @@
 #include "cfs-utils.h"
 #include "confdb.h"
 #include "dcdb.h"
+#include "dfsm-raft.h"
 #include "dfsm.h"
 #include "quorum.h"
 #include "server.h"
@@ -873,6 +874,16 @@ int main(int argc, char *argv[]) {
 
     cfs_status_init();
 
+    gboolean raft_mode = !force_local_mode && g_file_test(RAFT_CONF, G_FILE_TEST_EXISTS);
+    if (raft_mode) {
+        dfsm_set_backend(DFSM_BACKEND_RAFT);
+        if (!dfsm_raft_load_config(RAFT_CONF, cfs.nodename)) {
+            goto err;
+        }
+        /* the memdb is rebuilt from the last raft snapshot and the log */
+        unlink(DBFILENAME);
+    }
+
     gboolean create = !g_file_test(DBFILENAME, G_FILE_TEST_EXISTS);
 
     if (!(memdb = memdb_open(DBFILENAME))) {
@@ -881,7 +892,7 @@ int main(int argc, char *argv[]) {
     }
 
     // automatically import corosync.conf from host
-    if (create && !force_local_mode) {
+    if (create && !force_local_mode && !raft_mode) {
         char *cdata = NULL;
         gsize clen = 0;
         if (g_file_get_contents(HOST_CLUSTER_CONF_FN, &cdata, &clen, NULL)) {
@@ -898,8 +909,13 @@ int main(int argc, char *argv[]) {
 
     // does corosync.conf exist?
     gpointer conf_data = NULL;
-    int len = memdb_read(memdb, "corosync.conf", &conf_data);
-    if (len >= 0) {
+    int len = raft_mode ? -1 : memdb_read(memdb, "corosync.conf", &conf_data);
+    if (raft_mode) {
+        cfs_message("using raft mode");
+        if (!(dcdb = dcdb_new(memdb))) {
+            goto err;
+        }
+    } else if (len >= 0) {
         if (force_local_mode) {
             cfs_message("forcing local mode (although corosync.conf exists)");
             cfs_set_quorate(1, TRUE);
@@ -1011,7 +1027,15 @@ int main(int argc, char *argv[]) {
     cfs_service_t *service_dcdb = NULL;
     cfs_service_t *service_status = NULL;
 
-    if (dcdb) {
+    if (dcdb && raft_mode) {
+        /* quorum and membership are provided by the raft engine */
+        service_dcdb = service_dfsm_new(dcdb);
+        cfs_loop_add_service(corosync_loop, service_dcdb, QB_LOOP_MED);
+
+        status_fsm = cfs_status_dfsm_new();
+        service_status = service_dfsm_new(status_fsm);
+        cfs_loop_add_service(corosync_loop, service_status, QB_LOOP_LOW);
+    } else if (dcdb) {
 
         service_quorum = service_quorum_new();
 

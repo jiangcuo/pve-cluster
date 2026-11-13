@@ -13,6 +13,8 @@ use PVE::Cluster;
 use PVE::APIClient::LWP;
 use PVE::Corosync;
 use PVE::Cluster::Setup;
+use PVE::Network;
+use Digest::SHA;
 use JSON;
 
 use IO::Socket::UNIX;
@@ -177,6 +179,31 @@ __PACKAGE__->register_method({
     },
 });
 
+# raft backend: nodes have one address (link0); redundancy is up to the network (bond)
+my $raft_single_address = sub {
+    my ($param, $fallback) = @_;
+
+    my $links = PVE::Corosync::extract_corosync_link_args($param);
+    die "raft cluster nodes use a single address (link0), use a bond for redundancy\n"
+        if grep { $_ != 0 } keys %$links;
+
+    my $addr = $links->{0} ? $links->{0}->{address} : $fallback;
+    return undef if !defined($addr);
+    $addr = PVE::Network::get_ip_from_hostname($addr) if !PVE::JSONSchema::pve_verify_ip($addr, 1);
+    return $addr;
+};
+
+# corosync style totem section for the raft backend (compatibility for API users / GUI)
+my $raft_totem = sub {
+    my ($status) = @_;
+    return {
+        cluster_name => $status->{cluster},
+        config_version => PVE::Cluster::get_clinfo()->{cluster}->{version} // 1,
+        interface => { 0 => { linknumber => 0 } },
+        version => 2,
+    };
+};
+
 __PACKAGE__->register_method({
     name => 'create',
     path => '',
@@ -200,16 +227,84 @@ __PACKAGE__->register_method({
                 minimum => 1,
                 optional => 1,
             },
+            backend => {
+                type => 'string',
+                enum => ['corosync', 'raft'],
+                description => "Cluster communication backend. A raft cluster uses a single"
+                    . " address per node (link0).",
+                default => 'corosync',
+                optional => 1,
+            },
+            force => {
+                type => 'boolean',
+                description => "With backend 'raft' on a member of a corosync cluster: convert"
+                    . " this node into the first node of a new raft cluster.",
+                optional => 1,
+            },
         }),
     },
     returns => { type => 'string' },
     code => sub {
         my ($param) = @_;
 
-        die "cluster config '$clusterconf' already exists\n" if -f $clusterconf;
-
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
+
+        if (($param->{backend} // 'corosync') eq 'raft') {
+            my $nodename = PVE::INotify::nodename();
+            my $current = PVE::Cluster::get_cluster_backend();
+            my $address = $raft_single_address->($param);
+
+            my $local;
+            my $converting = 0;
+            if (($current // '') eq 'corosync') {
+                die "this node is a member of a corosync cluster - use 'force' to convert it"
+                    . " into the first node of a new raft cluster\n"
+                    if !$param->{force};
+                $converting = 1;
+            } elsif ($current) {
+                die "this node is already a member of a raft cluster\n";
+            }
+
+            my $code = sub {
+                STDOUT->autoflush();
+                if ($converting) {
+                    PVE::Cluster::Setup::raft_convert_precheck(1);
+                    $local = PVE::Cluster::Setup::raft_convert_local_node();
+                    $local->{ip} = $address if $address;
+                } else {
+                    PVE::Cluster::Setup::setup_sshd_config(1);
+                    PVE::Cluster::Setup::setup_rootsshconfig();
+                    PVE::Cluster::Setup::setup_ssh_keys();
+                    $local = {
+                        nodeid => $param->{nodeid} // 1,
+                        name => $nodename,
+                        ip => $address // scalar(PVE::Cluster::remote_node_ip($nodename)),
+                    };
+                }
+
+                PVE::Cluster::Setup::raft_create_cluster(
+                    $param->{clustername}, $local, $converting,
+                );
+
+                if (!$converting) {
+                    PVE::Cluster::Setup::ssh_merge_keys();
+                    PVE::Cluster::Setup::gen_pve_node_files($nodename, $local->{ip});
+                    PVE::Cluster::Setup::ssh_merge_known_hosts($nodename, $local->{ip}, 1);
+                }
+            };
+
+            my $worker = sub {
+                PVE::Tools::lock_file($local_cluster_lock, 10, $code);
+                die $@ if $@;
+            };
+
+            return $rpcenv->fork_worker('clustercreate', $param->{clustername}, $authuser, $worker);
+        }
+
+        die "cluster config '$clusterconf' already exists\n" if -f $clusterconf;
+        die "this node is already a member of a raft cluster\n"
+            if (PVE::Cluster::get_cluster_backend() // '') eq 'raft';
 
         my $code = sub {
             STDOUT->autoflush();
@@ -272,8 +367,13 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
-        my $nodelist = PVE::Corosync::nodelist($conf);
+        my $nodelist;
+        if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+            $nodelist = PVE::Cluster::get_raft_nodelist();
+        } else {
+            my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
+            $nodelist = PVE::Corosync::nodelist($conf);
+        }
 
         return PVE::RESTHandler::hash_to_array($nodelist, 'node');
     },
@@ -291,7 +391,12 @@ my $config_change_lock = sub {
         sub {
             PVE::Cluster::cfs_update(1);
             my $members = PVE::Cluster::get_members();
-            if (scalar(keys %$members) > 1) {
+            if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+                # no corosync.conf to lock
+                my $res = PVE::Cluster::cfs_lock_domain('cluster-config', 10, $code);
+                die $@ if $@;
+                return $res;
+            } elsif (scalar(keys %$members) > 1) {
                 my $res = PVE::Cluster::cfs_lock_file('corosync.conf', 10, $code);
 
                 # cfs_lock_file only sets $@ but lock_file doesn't propagates $@ unless we die here
@@ -346,10 +451,18 @@ __PACKAGE__->register_method({
         properties => {
             corosync_authkey => {
                 type => 'string',
+                optional => 1,
             },
             corosync_conf => {
                 type => 'string',
+                optional => 1,
             },
+            backend => { type => 'string', optional => 1 },
+            cluster_name => { type => 'string', optional => 1 },
+            nodeid => { type => 'integer', optional => 1 },
+            node_ip => { type => 'string', optional => 1 },
+            authkey => { type => 'string', optional => 1 },
+            voters => { type => 'integer', optional => 1 },
             warnings => {
                 type => 'array',
                 items => {
@@ -365,6 +478,54 @@ __PACKAGE__->register_method({
         PVE::Cluster::Setup::assert_node_can_join_our_version($param->{apiversion});
 
         PVE::Cluster::check_cfs_quorum();
+
+        if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+            my $res;
+            $config_change_lock->(sub {
+                my $name = $param->{node};
+                my $ip = $raft_single_address->($param, $param->{new_node_ip})
+                    // die "no address (link0 or new_node_ip) given, cannot join cluster\n";
+
+                my $nodelist = PVE::Cluster::get_raft_nodelist();
+                die "can't add existing node '$name'\n" if $nodelist->{$name};
+
+                my $used = { map { $_->{nodeid} => $_->{name} } values %$nodelist };
+                for my $node (values %$nodelist) {
+                    die "address '$ip' already used by node '$node->{name}'\n"
+                        if $node->{ring0_addr} eq $ip;
+                }
+
+                my $nodeid = $param->{nodeid};
+                if ($nodeid) {
+                    die "node id $nodeid already used by node '$used->{$nodeid}'\n"
+                        if $used->{$nodeid};
+                } else {
+                    $nodeid = 1;
+                    $nodeid++ while $used->{$nodeid};
+                }
+
+                PVE::Cluster::Setup::gen_local_dirs($name);
+                eval { PVE::Cluster::Setup::ssh_merge_keys(); };
+                warn $@ if $@;
+
+                PVE::Cluster::log_msg('notice', 'root@pam', "adding node $name to cluster");
+                PVE::Cluster::raft_add_node($nodeid, $name, $ip);
+
+                my $status = PVE::Cluster::get_raft_status();
+                my $authkey = PVE::Cluster::Setup::read_raft_authkey();
+
+                $res = {
+                    backend => 'raft',
+                    cluster_name => $status->{cluster},
+                    nodeid => $nodeid,
+                    node_ip => $ip,
+                    authkey => $authkey,
+                    voters => $status->{voters},
+                };
+            });
+            die $@ if $@;
+            return $res;
+        }
 
         my $vc_errors;
         my $vc_warnings;
@@ -562,6 +723,21 @@ __PACKAGE__->register_method({
 
         PVE::Cluster::check_cfs_quorum();
 
+        if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+            $config_change_lock->(sub {
+                my $nodelist = PVE::Cluster::get_raft_nodelist();
+                my ($node) = grep {
+                    $_->{name} eq $param->{node} || $_->{ring0_addr} eq $param->{node}
+                } values %$nodelist;
+                die "Node/IP: $param->{node} is not a known host of the cluster.\n" if !$node;
+
+                PVE::Cluster::log_msg('notice', 'root@pam', "deleting node $node->{name} from cluster");
+                PVE::Cluster::raft_remove_node($node->{nodeid});
+            });
+            die $@ if $@;
+            return undef;
+        }
+
         my $code = sub {
             my $conf = PVE::Cluster::cfs_read_file("corosync.conf");
             my $nodelist = PVE::Corosync::nodelist($conf);
@@ -650,6 +826,7 @@ __PACKAGE__->register_method({
             preferred_node => get_standard_option('pve-node'),
             totem => { type => 'object' },
             config_digest => { type => 'string' },
+            backend => { type => 'string', optional => 1 },
         },
     },
     code => sub {
@@ -658,6 +835,29 @@ __PACKAGE__->register_method({
         my $nodename = $param->{node} // PVE::INotify::nodename();
 
         PVE::Cluster::cfs_update(1);
+
+        if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+            my $status = PVE::Cluster::get_raft_status();
+            my $nodelist = PVE::Cluster::get_raft_nodelist();
+            die "unknown node '$nodename'\n" if !$nodelist->{$nodename};
+
+            for my $node (values %$nodelist) {
+                delete $node->@{qw(role online)};
+                $node->{pve_fp} = PVE::Cluster::get_node_fingerprint($node->{name});
+                $node->{pve_addr} = scalar(PVE::Cluster::remote_node_ip($node->{name}));
+            }
+
+            return {
+                nodelist => [values %$nodelist],
+                preferred_node => $nodename,
+                totem => $raft_totem->($status),
+                config_digest => Digest::SHA::sha1_hex(
+                    join(',', map { "$_->{nodeid}:$_->{name}" } sort { $a->{nodeid} <=> $b->{nodeid} } values %$nodelist)
+                ),
+                backend => 'raft',
+            };
+        }
+
         my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
 
         # FIXME: just return undef or empty object in PVE 8.0 (check if manager can handle it!)
@@ -759,6 +959,10 @@ __PACKAGE__->register_method({
     },
     code => sub {
         my ($param) = @_;
+
+        if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+            return $raft_totem->(PVE::Cluster::get_raft_status());
+        }
 
         my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
 

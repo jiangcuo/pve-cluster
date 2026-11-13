@@ -15,6 +15,9 @@ Build-Depends: check,
                libpve-common-perl (>= 5.0-28),
                libqb-dev (>= 2.0.1),
                libquorum-dev (>= 2.3.4),
+               libraft-dev (>= 0.22.1),
+               libssl-dev,
+               libuv1-dev,
                librrd-dev,
                librrds-perl,
                libsqlite3-dev,
@@ -34,6 +37,7 @@ Depends: corosync (>= 2.3.4-1),
          libglib2.0-0 (>= 2.42.1-1),
          libpve-common-perl (>= 6.0-7~),
          libqb100,
+         libraft0 (>= 0.22.1),
          libsqlite3-0,
          sqlite3,
          systemd,
@@ -48,8 +52,8 @@ Breaks: libpve-access-control (<= 6.0-3),
         pve-manager (<= 6.0-12),
         qemu-server (<= 6.0-13),
 Description: "pmxcfs" distributed cluster filesystem for Proxmox Virtual Environment.
- This FUSE filesystem is using corosync and sqlite3 to provide a cluster-wide,
- consistent view of config and other files.
+ This FUSE filesystem is using corosync or raft and sqlite3 to provide a
+ cluster-wide, consistent view of config and other files.
 
 Package: libpve-cluster-perl
 Architecture: all

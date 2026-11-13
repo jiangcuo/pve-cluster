@@ -41,6 +41,7 @@
 #include "dcdb.h"
 #include "loop.h"
 #include "status.h"
+#include "dfsm-raft.h"
 
 typedef struct {
     memdb_index_t *master;
@@ -798,7 +799,8 @@ static int dcdb_deliver(
 
     cfs_debug("process message %u (length = %zd)", msg_type, msg_len);
 
-    if (!cfs_is_quorate()) {
+    /* raft: apply must be deterministic, committed entries are always valid */
+    if (!dfsm_backend_is_raft() && !cfs_is_quorate()) {
         cfs_critical("received write while not quorate - trigger resync");
         msg_result = -EACCES;
         goto leave;
@@ -932,10 +934,161 @@ static dfsm_callbacks_t dcdb_dfsm_callbacks = {
     .dfsm_checksum_fn = dcdb_checksum,
 };
 
+#define DCDB_SNAPSHOT_MAGIC 0x31534344 /* "DCS1" */
+
+static void dcdb_snapshot_append(GByteArray *ba, const void *data, size_t len) {
+    g_byte_array_append(ba, (const guint8 *)data, len);
+}
+
+/* Raft snapshot: the memdb index followed by every tree entry, each entry
+ * encoded like the CPG state transfer (see dcdb_send_update_inode) */
+static gpointer dcdb_snapshot_create(gpointer data, size_t *res_len) {
+    memdb_t *memdb = (memdb_t *)data;
+    GByteArray *ba = g_byte_array_new();
+    gboolean ok = FALSE;
+
+    g_mutex_lock(&memdb->mutex);
+
+    memdb_index_t *idx = memdb_encode_index(memdb->index, memdb->root);
+    if (!idx) {
+        goto ret;
+    }
+
+    guint32 magic = DCDB_SNAPSHOT_MAGIC;
+    dcdb_snapshot_append(ba, &magic, sizeof(magic));
+    dcdb_snapshot_append(ba, &idx->bytes, sizeof(idx->bytes));
+    dcdb_snapshot_append(ba, idx, idx->bytes);
+
+    for (guint32 i = 0; i < idx->size; i++) {
+        memdb_tree_entry_t *te = g_hash_table_lookup(memdb->index, &idx->entries[i].inode);
+        if (!te) {
+            cfs_critical("snapshot: missing inode %016" PRIX64, (uint64_t)idx->entries[i].inode);
+            goto ret;
+        }
+
+        guint32 namelen = strlen(te->name) + 1;
+        guint32 datalen = (te->type == DT_REG && te->size) ? te->size : 0;
+        guint32 len = sizeof(te->parent) + sizeof(te->inode) + sizeof(te->version) +
+                      sizeof(te->writer) + sizeof(te->mtime) + sizeof(te->size) +
+                      sizeof(namelen) + sizeof(te->type) + namelen + datalen;
+
+        dcdb_snapshot_append(ba, &len, sizeof(len));
+        dcdb_snapshot_append(ba, &te->parent, sizeof(te->parent));
+        dcdb_snapshot_append(ba, &te->inode, sizeof(te->inode));
+        dcdb_snapshot_append(ba, &te->version, sizeof(te->version));
+        dcdb_snapshot_append(ba, &te->writer, sizeof(te->writer));
+        dcdb_snapshot_append(ba, &te->mtime, sizeof(te->mtime));
+        dcdb_snapshot_append(ba, &te->size, sizeof(te->size));
+        dcdb_snapshot_append(ba, &namelen, sizeof(namelen));
+        dcdb_snapshot_append(ba, &te->type, sizeof(te->type));
+        dcdb_snapshot_append(ba, te->name, namelen);
+        if (datalen) {
+            dcdb_snapshot_append(ba, te->data.value, datalen);
+        }
+    }
+
+    ok = TRUE;
+
+ret:
+    g_mutex_unlock(&memdb->mutex);
+    g_free(idx);
+
+    if (!ok) {
+        g_byte_array_free(ba, TRUE);
+        return NULL;
+    }
+
+    *res_len = ba->len;
+    return g_byte_array_free(ba, FALSE);
+}
+
+static gboolean dcdb_snapshot_restore(gpointer data, const void *buf, size_t len) {
+    memdb_t *memdb = (memdb_t *)data;
+    const guint8 *p = buf;
+    const guint8 *end = p + len;
+    memdb_index_t *master = NULL;
+    memdb_index_t *local = NULL;
+    GList *updates = NULL;
+    gboolean ok = FALSE;
+    guint32 magic, bytes;
+
+    if (len < 8) {
+        goto fail;
+    }
+    memcpy(&magic, p, 4);
+    memcpy(&bytes, p + 4, 4);
+    p += 8;
+    if (magic != DCDB_SNAPSHOT_MAGIC || bytes < sizeof(memdb_index_t) || bytes > end - p) {
+        goto fail;
+    }
+
+    master = g_malloc(bytes);
+    memcpy(master, p, bytes);
+    p += bytes;
+    if (master->bytes != bytes ||
+        bytes != sizeof(memdb_index_t) + master->size * sizeof(memdb_index_extry_t)) {
+        goto fail;
+    }
+
+    for (guint32 i = 0; i < master->size; i++) {
+        guint32 elen;
+        if (end - p < 4) {
+            goto fail;
+        }
+        memcpy(&elen, p, 4);
+        p += 4;
+        if (elen > end - p) {
+            goto fail;
+        }
+        memdb_tree_entry_t *te = dcdb_parse_update_inode(p, elen);
+        if (!te) {
+            goto fail;
+        }
+        updates = g_list_prepend(updates, te);
+        p += elen;
+    }
+    if (p != end) {
+        goto fail;
+    }
+
+    g_mutex_lock(&memdb->mutex);
+    local = memdb_encode_index(memdb->index, memdb->root);
+    g_mutex_unlock(&memdb->mutex);
+
+    if (!local) {
+        goto fail;
+    }
+
+    cfs_message(
+        "restoring snapshot: version %016" PRIX64 ", %u inodes (local version %016" PRIX64 ")",
+        (uint64_t)master->version, master->size, (uint64_t)local->version
+    );
+
+    /* writes everything, deletes what is not in master, reloads and
+     * verifies the result against the master index */
+    ok = bdb_backend_commit_update(memdb, master, local, updates);
+    goto ret;
+
+fail:
+    cfs_critical("unable to parse raft snapshot");
+
+ret:
+    g_list_free_full(updates, (GDestroyNotify)memdb_tree_entry_free);
+    g_free(master);
+    g_free(local);
+    return ok;
+}
+
 dfsm_t *dcdb_new(memdb_t *memdb) {
     g_return_val_if_fail(memdb != NULL, NULL);
 
-    return dfsm_new(
+    dfsm_t *dfsm = dfsm_new(
         memdb, DCDB_CPG_GROUP_NAME, G_LOG_DOMAIN, DCDB_PROTOCOL_VERSION, &dcdb_dfsm_callbacks
     );
+
+    if (dfsm && dfsm_backend_is_raft()) {
+        dfsm_raft_set_snapshot_callbacks(dfsm, dcdb_snapshot_create, dcdb_snapshot_restore);
+    }
+
+    return dfsm;
 }

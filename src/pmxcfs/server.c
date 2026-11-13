@@ -25,10 +25,13 @@
 #endif /* HAVE_CONFIG_H */
 
 #include <errno.h>
+#include <poll.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/syslog.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
 #include <qb/qbdefs.h>
 #include <qb/qbipcs.h>
@@ -39,6 +42,7 @@
 
 #include "cfs-ipc-ops.h"
 #include "cfs-utils.h"
+#include "dfsm-raft.h"
 #include "logger.h"
 #include "memdb.h"
 #include "status.h"
@@ -46,6 +50,17 @@
 static GThread *worker;
 static qb_loop_t *loop;
 static qb_ipcs_service_t *s1;
+
+/* Raft membership changes finish later, on the raft thread. Their reply is queued and
+ * sent from the server thread, which keeps serving other requests meanwhile. */
+typedef struct {
+    qb_ipcs_connection_t *c;
+    int32_t request_id;
+    int32_t result;
+} deferred_reply_t;
+
+static GAsyncQueue *deferred_replies;
+static int deferred_fd = -1;
 static GString *outbuf;
 static memdb_t *memdb;
 
@@ -152,6 +167,42 @@ static int32_t s1_connection_closed_fn(qb_ipcs_connection_t *c) {
     qb_ipcs_connection_stats_get(c, &stats, QB_FALSE);
 
     cfs_debug("Connection to pid:%d destroyed", stats.client_pid);
+
+    return 0;
+}
+
+/* raft thread */
+static void raft_change_done(gpointer data, int result) {
+    deferred_reply_t *d = data;
+    d->result = result;
+    g_async_queue_push(deferred_replies, d);
+
+    uint64_t one = 1;
+    if (write(deferred_fd, &one, sizeof(one)) < 0) {
+        cfs_critical("unable to wake the server thread: %s", strerror(errno));
+    }
+}
+
+/* server thread */
+static int32_t deferred_reply_dispatch(int32_t fd, int32_t revents, void *data) {
+    uint64_t count;
+    if (read(fd, &count, sizeof(count)) < 0 && errno != EAGAIN) {
+        cfs_critical("read from deferred reply fd failed: %s", strerror(errno));
+    }
+
+    deferred_reply_t *d;
+    while ((d = g_async_queue_try_pop(deferred_replies))) {
+        struct qb_ipc_response_header res_header = {
+            .id = d->request_id,
+            .size = sizeof(res_header),
+            .error = d->result,
+        };
+        if (qb_ipcs_response_send(d->c, &res_header, sizeof(res_header)) < 0) {
+            cfs_debug("unable to send deferred reply - client gone");
+        }
+        qb_ipcs_connection_unref(d->c);
+        g_free(d);
+    }
 
     return 0;
 }
@@ -396,6 +447,31 @@ static int32_t s1_msg_process_fn(qb_ipcs_connection_t *c, void *data, size_t siz
 
             free(properties);
         }
+    } else if (request_id == CFS_IPC_GET_RAFT_STATUS || request_id == CFS_IPC_RAFT_CHANGE) {
+        /* status JSON, or "add <id> <name> <ip>" / "remove <id>" */
+        int cmdlen = request_size - sizeof(struct qb_ipc_request_header);
+        const char *cmd = (const char *)data + sizeof(struct qb_ipc_request_header);
+
+        if (!dfsm_backend_is_raft()) {
+            result = -ENOTSUP;
+        } else if (request_id == CFS_IPC_GET_RAFT_STATUS) {
+            result = cmdlen == 0 ? dfsm_raft_get_status(outbuf) : -EINVAL;
+        } else if (ctx->read_only) {
+            result = -EPERM;
+        } else if (cmdlen <= 0 || cmd[cmdlen - 1] != 0 || strlen(cmd) != cmdlen - 1) {
+            result = -EINVAL;
+        } else {
+            deferred_reply_t *d = g_new0(deferred_reply_t, 1);
+            d->c = c;
+            d->request_id = request_id;
+            qb_ipcs_connection_ref(c);
+            result = dfsm_raft_change(cmd, raft_change_done, d);
+            if (result == 0) {
+                return 0; /* replied from deferred_reply_dispatch */
+            }
+            qb_ipcs_connection_unref(c);
+            g_free(d);
+        }
     } else if (request_id == CFS_IPC_VERIFY_TOKEN) {
 
         cfs_verify_token_request_header_t *rh = (cfs_verify_token_request_header_t *)data;
@@ -579,6 +655,20 @@ gboolean server_start(memdb_t *db) {
 
     if (!(loop = qb_loop_create())) {
         cfs_critical("cant create event loop");
+        return FALSE;
+    }
+
+    /* kept for the process lifetime: the raft thread may still finish a change */
+    if (deferred_fd < 0) {
+        deferred_replies = g_async_queue_new();
+        if ((deferred_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) {
+            cfs_critical("eventfd failed: %s", strerror(errno));
+            return FALSE;
+        }
+    }
+    if (qb_loop_poll_add(loop, QB_LOOP_MED, deferred_fd, POLLIN, NULL, deferred_reply_dispatch) !=
+        0) {
+        cfs_critical("unable to watch the deferred reply fd");
         return FALSE;
     }
 

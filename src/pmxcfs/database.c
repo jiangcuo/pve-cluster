@@ -570,7 +570,7 @@ gboolean bdb_backend_commit_update(
         goto abort;
     }
 
-    if (!memdb->root->version) {
+    if (!root->version) {
         cfs_critical("new index has version 0 - internal error");
         goto abort;
     }

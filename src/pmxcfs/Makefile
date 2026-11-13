@@ -1,5 +1,5 @@
 
-DEPENDENCIES=libcpg libcmap libquorum libqb glib-2.0 fuse sqlite3 librrd
+DEPENDENCIES=libcpg libcmap libquorum libqb glib-2.0 fuse sqlite3 librrd raft libuv libssl libcrypto
 
 CC = gcc
 CFLAGS += -std=gnu99
@@ -20,6 +20,7 @@ ARFLAGS = crs
 all: pmxcfs create_pmxcfs_db logtest check_memdb
 
 libpmxcfs.a: logger.o loop.o server.o status.o confdb.o quorum.o dcdb.o dfsm.o
+libpmxcfs.a: dfsm-backend.o dfsm-raft.o rsm-tls.o
 libpmxcfs.a: cfs-plug.o cfs-plug-memdb.o cfs-plug-link.o cfs-plug-func.o
 libpmxcfs.a: cfs-utils.o memdb.o database.o
 libpmxcfs.a:
@@ -37,6 +38,13 @@ logtest: logtest.o libpmxcfs.a
 
 logtest2: logtest2.o libpmxcfs.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# both dfsm backends are linked in, see dfsm-rename.h
+dfsm.o: dfsm.c
+	$(CC) $(CFLAGS) -include dfsm-rename.h -DDFSM_RENAME_CPG -c -o $@ $< -MMD -MT $@ -MF $@.d
+
+dfsm-raft.o: dfsm-raft.c
+	$(CC) $(CFLAGS) -include dfsm-rename.h -DDFSM_RENAME_RAFT -c -o $@ $< -MMD -MT $@ -MF $@.d
 
 check_memdb: check_memdb.o libpmxcfs.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs check)

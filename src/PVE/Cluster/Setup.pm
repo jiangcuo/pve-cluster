@@ -5,6 +5,8 @@ use warnings;
 
 use Digest::HMAC_SHA1;
 use Digest::SHA;
+use File::Copy;
+use File::Find;
 use IO::File;
 use MIME::Base64;
 use Net::IP;
@@ -71,6 +73,11 @@ my $localclusterdir = "/etc/corosync";
 my $localclusterconf = "$localclusterdir/corosync.conf";
 my $authfile = "$localclusterdir/authkey";
 my $clusterconf = "$pmxcfs_base_dir/corosync.conf";
+
+# raft backend, local files (see pmxcfs dfsm-raft.h); raft.conf selects raft mode
+my $raft_conf_fn = "/var/lib/pve-cluster/raft.conf";
+my $raft_authkey_fn = "/var/lib/pve-cluster/authkey";
+my $backupdir = "/var/lib/pve-cluster/backup";
 
 # CA/certificate related files
 my $pveca_key_fn = "$pmxcfs_auth_dir/pve-root-ca.key";
@@ -651,11 +658,315 @@ sub gen_pve_vzdump_files {
 
 # join helpers
 
+sub gen_raft_authkey {
+    open(my $fh, '<', '/dev/urandom') or die "unable to open /dev/urandom - $!\n";
+    my $bytes = '';
+    my $len = read($fh, $bytes, 32);
+    close($fh);
+    die "unable to read random bytes\n" if !$len || $len != 32;
+
+    return encode_base64($bytes, '');
+}
+
+# Write the local raft files; raft.conf goes last, its existence selects the raft backend
+# when pmxcfs starts. $members is only set when creating a new cluster.
+sub write_raft_files {
+    my ($cluster_name, $local, $members, $authkey, $voters) = @_;
+
+    my $conf = "cluster $cluster_name\n";
+    $conf .= "voters $voters\n" if $voters;
+    $conf .= "local $local->{nodeid} $local->{name} $local->{ip}\n";
+    for my $member (@{ $members // [] }) {
+        $conf .= "member $member->{nodeid} $member->{name} $member->{ip} voter\n";
+    }
+
+    PVE::Tools::file_set_contents($raft_authkey_fn, "$authkey\n", 0600);
+    PVE::Tools::file_set_contents($raft_conf_fn, $conf, 0644);
+}
+
+# returns false if $timeout (seconds, optional) passed without quorum
+my $wait_for_quorum = sub {
+    my ($timeout) = @_;
+    my $printqmsg = 1;
+    my $start = time();
+    while (!PVE::Cluster::check_cfs_quorum(1)) {
+        if ($printqmsg) {
+            print "waiting for quorum...";
+            STDOUT->flush();
+            $printqmsg = 0;
+        }
+        if ($timeout && time() - $start > $timeout) {
+            print "timeout\n";
+            return 0;
+        }
+        sleep(1);
+    }
+    print "OK\n" if !$printqmsg;
+    return 1;
+};
+
+my $address_is_local = sub {
+    my ($ip) = @_;
+    my $cidr = Net::IP::ip_is_ipv6($ip) ? "$ip/128" : "$ip/32";
+    return scalar(@{ PVE::Network::get_local_ip_from_cidr($cidr) }) > 0;
+};
+
+# --- conversion of a corosync cluster to raft, one node at a time ---
+#
+# The first node runs 'pvecm create <name> --backend raft --force', every other node
+# 'pvecm add <raft node> --force'. The configuration must stay frozen until all nodes are
+# converted, as the old corosync and the new raft cluster do not sync with each other.
+
+# $first: the first node, whose /etc/pve becomes the content of the new cluster. Its corosync
+# cluster must be quorate (up to date). Later nodes take the data of the raft cluster; their
+# corosync cluster may already have lost quorum, as more than half of the nodes are converted.
+sub raft_convert_precheck {
+    my ($first) = @_;
+
+    die "corosync cluster is not quorate - unable to convert the first node\n"
+        if $first && !PVE::Cluster::check_cfs_quorum(1);
+
+    # HA resources would trigger watchdog fencing while pmxcfs restarts / loses quorum
+    my @active;
+    my $ha_resources = "$pmxcfs_base_dir/ha/resources.cfg";
+    if (-f $ha_resources) {
+        my ($sid, $state);
+        my $flush = sub {
+            push @active, $sid if defined($sid) && ($state // 'started') !~ m/^(ignored|disabled)$/;
+        };
+        for my $line (split(/\n/, PVE::Tools::file_get_contents($ha_resources))) {
+            if ($line =~ m/^(\S+):\s*(\S+)\s*$/) {
+                $flush->();
+                ($sid, $state) = ("$1:$2", undef);
+            } elsif ($line =~ m/^\s+state\s+(\S+)/) {
+                $state = $1;
+            }
+        }
+        $flush->();
+    }
+    die "HA resources must be 'ignored' or 'disabled' during the conversion: "
+        . join(', ', @active)
+        . "\n(use 'ha-manager set <sid> --state ignored', revert after all nodes are converted)\n"
+        if @active;
+
+    print "converting this node to the raft cluster backend\n"
+        . "the cluster configuration must not change until all nodes are converted\n"
+        . "(no guest creation, migration or configuration changes, no replication or backup jobs)\n";
+}
+
+# node id, name and corosync link 0 address of this node
+sub raft_convert_local_node {
+    my $conf = PVE::Cluster::cfs_read_file('corosync.conf');
+    my $nodename = PVE::INotify::nodename();
+    my $node = PVE::Corosync::nodelist($conf)->{$nodename}
+        or die "node '$nodename' not found in corosync.conf\n";
+
+    my $ip = $node->{ring0_addr} // PVE::Cluster::remote_node_ip($nodename);
+    $ip = PVE::Network::get_ip_from_hostname($ip) if !PVE::JSONSchema::pve_verify_ip($ip, 1);
+
+    return {
+        nodeid => $node->{nodeid},
+        name => $nodename,
+        ip => $ip,
+    };
+}
+
+my $make_backupdir = sub {
+    mkdir $backupdir or $!{EEXIST} or die "failed to create backup dir - $!\n";
+    chmod 0700, $backupdir or die "failed to set mode for backup dir - $!\n";
+};
+
+# stops corosync and moves its config to the backup directory, returns the saved path
+sub raft_convert_disable_corosync {
+    print "stopping and disabling corosync\n";
+    PVE::Tools::run_command(['systemctl', 'stop', 'corosync'], noerr => 1);
+    PVE::Tools::run_command(['systemctl', 'disable', 'corosync'], noerr => 1);
+
+    return undef if !-f $localclusterconf;
+
+    $make_backupdir->();
+    my $saved = "$backupdir/corosync-" . time() . ".conf";
+    File::Copy::move($localclusterconf, $saved)
+        or die "unable to move '$localclusterconf' to '$saved' - $!\n";
+    print "moved '$localclusterconf' to '$saved'\n";
+
+    return $saved;
+}
+
+sub read_raft_authkey {
+    my $authkey = PVE::Tools::file_get_contents($raft_authkey_fn);
+    chomp $authkey;
+    return $authkey;
+}
+
+# paths in /etc/pve that are not copied: virtual files, node symlinks, corosync config, locks
+my $raft_convert_excludes = [
+    qw(.version .members .vmlist .clusterlog .rrd .debug),
+    qw(local qemu-server lxc openvz corosync.conf corosync.conf.new priv/lock),
+];
+
+# sha256 of every regular file in /etc/pve, by relative path
+my $pve_tree_digest = sub {
+    my $excluded = { map { $_ => 1 } @$raft_convert_excludes };
+    my $res = {};
+    File::Find::find(
+        {
+            no_chdir => 1,
+            wanted => sub {
+                my $rel = $File::Find::name =~ s|^\Q$pmxcfs_base_dir\E/?||r;
+                if ($excluded->{$rel}) {
+                    $File::Find::prune = 1;
+                    return;
+                }
+                return if -l $File::Find::name || !-f $File::Find::name;
+                $res->{$rel} = Digest::SHA::sha256_hex(
+                    PVE::Tools::file_get_contents($File::Find::name, 1024 * 1024)
+                );
+            },
+        },
+        $pmxcfs_base_dir,
+    );
+    return $res;
+};
+
+# Create a raft cluster with this node as its first member. The current content of /etc/pve
+# is kept: saved, pmxcfs restarted with the raft backend (which starts from an empty
+# database), restored through the cluster filesystem and verified. With $converting this
+# node leaves its corosync cluster (first node of a conversion).
+sub raft_create_cluster {
+    my ($cluster_name, $local, $converting) = @_;
+
+    # pmxcfs listens on this address - fail before touching anything
+    die "address '$local->{ip}' is not configured on this node - check /etc/hosts"
+        . " or pass the cluster address as link0\n"
+        if !$address_is_local->($local->{ip});
+
+    # contains the private keys of /etc/pve/priv
+    $make_backupdir->();
+    my $tarfile = "$backupdir/etc-pve-" . time() . ".tar";
+
+    print "saving the current configuration to '$tarfile'\n";
+    my $before = $pve_tree_digest->();
+    PVE::Tools::run_command(
+        [
+            'tar',
+            '-C',
+            $pmxcfs_base_dir,
+            '--anchored',
+            (map { ('--exclude', "./$_") } @$raft_convert_excludes),
+            '-cf',
+            $tarfile,
+            '.',
+        ],
+        errmsg => "unable to save the configuration",
+    );
+
+    my $authkey = gen_raft_authkey();
+
+    print "stopping pve-cluster service\n";
+    PVE::Tools::run_command(['systemctl', 'stop', 'pve-cluster'],
+        errmsg => "can't stop pve-cluster service");
+    eval { PVE::Cluster::cfs_backup_database() };
+    if (my $err = $@) {
+        # nothing changed yet, bring the old cluster filesystem back
+        PVE::Tools::run_command(['systemctl', 'start', 'pve-cluster']);
+        die "failed to create backup of the config database - $err";
+    }
+    my ($backup) = sort { $b cmp $a } glob("$backupdir/config-*.sql.gz");
+
+    my ($after, $corosync_saved);
+    eval {
+        $corosync_saved = raft_convert_disable_corosync() if $converting;
+        write_raft_files($cluster_name, $local, [$local], $authkey);
+
+        print "starting pve-cluster service with the raft backend\n";
+        PVE::Tools::run_command(['systemctl', 'start', 'pve-cluster'],
+            errmsg => "starting pve-cluster failed");
+        $wait_for_quorum->(60)
+            or die "the raft backend did not become quorate, see 'journalctl -u pve-cluster'\n";
+
+        print "restoring the configuration into the raft cluster\n";
+        PVE::Tools::run_command(
+            [
+                'tar',
+                '-C',
+                $pmxcfs_base_dir,
+                '--no-same-owner',
+                '--no-same-permissions',
+                '-xf',
+                $tarfile,
+            ],
+            errmsg => "unable to restore the configuration",
+        );
+
+        $after = $pve_tree_digest->();
+        my @diff = grep { ($before->{$_} // '') ne ($after->{$_} // '') }
+            keys %{ { %$before, %$after } };
+        die "configuration differs after the conversion: " . join(', ', sort @diff) . "\n"
+            if @diff;
+    };
+    if (my $err = $@) {
+        raft_create_rollback($backup, $corosync_saved);
+        die "creating the raft cluster failed: ${err}rolled back to the previous state\n";
+    }
+
+    print "created raft cluster '$cluster_name' on node '$local->{name}' (id $local->{nodeid}), "
+        . scalar(keys %$after)
+        . " files verified\n";
+
+    # /etc/pve was rebuilt, the API daemons cache keys from it (e.g. pve-www.key for CSRF)
+    print "reload pveproxy and pvedaemon services\n";
+    PVE::Tools::run_command(['systemctl', 'reload-or-restart', 'pvedaemon', 'pveproxy']);
+
+    print "convert the other nodes one by one with 'pvecm add $local->{ip} --force'\n"
+        if $converting;
+}
+
+# back to the state before raft_create_cluster: the database from $backup, no raft files,
+# corosync again with its config from $corosync_saved (when converting). The files of the
+# failed attempt are kept in the backup directory.
+sub raft_create_rollback {
+    my ($backup, $corosync_saved) = @_;
+
+    warn "rolling back\n";
+    PVE::Tools::run_command(['systemctl', 'stop', 'pve-cluster'], noerr => 1);
+
+    my $libdir = "/var/lib/pve-cluster";
+    my $keep = "$backupdir/rollback-" . time();
+    mkdir $keep;
+    for my $f (qw(raft.conf authkey raft config.db config.db-shm config.db-wal)) {
+        rename("$libdir/$f", "$keep/$f") if -e "$libdir/$f";
+    }
+    warn "files of the failed attempt moved to '$keep'\n";
+
+    if ($backup) {
+        warn "restoring the database from '$backup'\n";
+        PVE::Tools::run_command(
+            [['zcat', $backup], ['sqlite3', "$libdir/config.db"]],
+            errmsg => "unable to restore '$backup'",
+        );
+    }
+
+    if ($corosync_saved && -f $corosync_saved) {
+        File::Copy::move($corosync_saved, $localclusterconf)
+            or warn "unable to restore '$localclusterconf' from '$corosync_saved' - $!\n";
+    }
+    if (-f $localclusterconf) {
+        PVE::Tools::run_command(['systemctl', 'enable', '--now', 'corosync'], noerr => 1);
+    }
+
+    PVE::Tools::run_command(['systemctl', 'start', 'pve-cluster'], noerr => 1);
+}
+
 sub assert_joinable {
     my ($local_addr, $links, $force) = @_;
 
     my $errors = '';
     my $error = sub { $errors .= "* $_[0]\n"; };
+
+    if (-f $raft_conf_fn || -f $raft_authkey_fn) {
+        $error->("raft cluster config '$raft_conf_fn' already exists");
+    }
 
     if (-f $authfile) {
         $error->("authentication key '$authfile' already exists");
@@ -715,8 +1026,12 @@ sub join {
 
     my $links = PVE::Corosync::extract_corosync_link_args($param);
 
+    # A corosync cluster member joining a raft cluster is converted (decided after login,
+    # once we know the backend of the other side); everything else is checked as usual.
+    my $in_corosync_cluster = (PVE::Cluster::get_cluster_backend() // '') eq 'corosync';
+
     # check if we can join with the given parameters and current node state
-    assert_joinable($local_ip_address, $links, $param->{force});
+    assert_joinable($local_ip_address, $links, $param->{force}) if !$in_corosync_cluster;
 
     setup_sshd_config();
     setup_rootsshconfig();
@@ -753,6 +1068,23 @@ sub join {
     print "check cluster join API version\n";
     my $apiver = eval { $conn->get("/cluster/config/apiversion") } // 0;
     assert_we_can_join_cluster_version($apiver);
+
+    my $converting = 0;
+    if ($in_corosync_cluster) {
+        my $info = eval { $conn->get("/cluster/config/join") } // {};
+        if (($info->{backend} // '') eq 'raft') {
+            die "this node is a member of a corosync cluster - use --force to convert it to"
+                . " the raft cluster of '$host'\n"
+                if !$param->{force};
+            raft_convert_precheck();
+            my $local = raft_convert_local_node();
+            $local_ip_address = $local->{ip};
+            $param->{nodeid} //= $local->{nodeid};
+            $converting = 1;
+        } else {
+            assert_joinable($local_ip_address, $links, $param->{force});
+        }
+    }
 
     my $args = {};
     $args->{force} = $param->{force} if defined($param->{force});
@@ -802,7 +1134,11 @@ sub join {
     print "Join request OK, finishing setup locally\n";
 
     # added successfuly - now prepare local node
-    finish_join($nodename, $res->{corosync_conf}, $res->{corosync_authkey});
+    if (($res->{backend} // '') eq 'raft') {
+        finish_join_raft($nodename, $res, $converting);
+    } else {
+        finish_join($nodename, $res->{corosync_conf}, $res->{corosync_authkey});
+    }
 }
 
 sub finish_join {
@@ -827,17 +1163,48 @@ sub finish_join {
     $cmd = ['systemctl', 'start', 'corosync', 'pve-cluster'];
     PVE::Tools::run_command($cmd, errmsg => "starting pve-cluster failed");
 
-    # wait for quorum
-    my $printqmsg = 1;
-    while (!PVE::Cluster::check_cfs_quorum(1)) {
-        if ($printqmsg) {
-            print "waiting for quorum...";
-            STDOUT->flush();
-            $printqmsg = 0;
-        }
-        sleep(1);
+    $wait_for_quorum->();
+
+    finish_join_common($nodename);
+}
+
+# $res: reply of the raft cluster's addnode (cluster_name, nodeid, node_ip, authkey, voters);
+# $converting: this node leaves a corosync cluster
+sub finish_join_raft {
+    my ($nodename, $res, $converting) = @_;
+
+    print "stopping pve-cluster service\n";
+    PVE::Tools::run_command(['systemctl', 'stop', 'pve-cluster'],
+        errmsg => "can't stop pve-cluster service");
+
+    raft_convert_disable_corosync() if $converting;
+
+    write_raft_files(
+        $res->{cluster_name},
+        { nodeid => $res->{nodeid}, name => $nodename, ip => $res->{node_ip} },
+        undef,
+        $res->{authkey},
+        $res->{voters},
+    );
+
+    eval { PVE::Cluster::cfs_backup_database() };
+    if (my $err = $@) {
+        warn "failed to create backup of pre-join config database - $err";
+        PVE::Cluster::cfs_rename_db_unsafe();
+    } else {
+        PVE::Cluster::cfs_unlink_db_unsafe();
     }
-    print "OK\n" if !$printqmsg;
+
+    PVE::Tools::run_command(['systemctl', 'start', 'pve-cluster'],
+        errmsg => "starting pve-cluster failed");
+
+    $wait_for_quorum->();
+
+    finish_join_common($nodename);
+}
+
+sub finish_join_common {
+    my ($nodename) = @_;
 
     generate_local_files();
     updatecerts_and_ssh(1);

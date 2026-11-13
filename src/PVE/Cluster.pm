@@ -315,6 +315,63 @@ sub get_nodelist {
     return [keys %$nodelist];
 }
 
+# cluster backend of this node: 'raft', 'corosync' or undef (not clustered)
+# raft.conf is a local file, not in /etc/pve
+my $raft_conf_fn = "/var/lib/pve-cluster/raft.conf";
+
+sub get_cluster_backend {
+    return 'raft' if -f $raft_conf_fn;
+    return 'corosync' if -f "$basedir/corosync.conf";
+    return undef;
+}
+
+# raft backend only: leader, term, members with role and online state
+sub get_raft_status {
+    return $ipcc_send_rec_json->(CFS_IPC_GET_RAFT_STATUS);
+}
+
+# raft backend only: membership changes, run by the leader (details in the syslog on failure)
+my $raft_change = sub {
+    my ($cmd) = @_;
+
+    PVE::IPCC::ipcc_send_rec(CFS_IPC_RAFT_CHANGE, "$cmd\0");
+    die "$!\n" if $! != 0;
+};
+
+sub raft_add_node {
+    my ($nodeid, $name, $ip) = @_;
+
+    eval { $raft_change->("add $nodeid $name $ip") };
+    die "unable to add node '$name' to the cluster - $@" if $@;
+}
+
+sub raft_remove_node {
+    my ($nodeid) = @_;
+
+    eval { $raft_change->("remove $nodeid") };
+    die "unable to remove node $nodeid from the cluster - $@" if $@;
+}
+
+# raft members in the format of PVE::Corosync::nodelist
+sub get_raft_nodelist {
+    my $status = get_raft_status();
+
+    my $nodelist = {};
+    for my $member ($status->{members}->@*) {
+        next if !$member->{name};
+        $nodelist->{ $member->{name} } = {
+            name => $member->{name},
+            nodeid => $member->{id},
+            ring0_addr => $member->{ip},
+            quorum_votes => $member->{role} eq 'voter' ? 1 : 0,
+            role => $member->{role},
+            online => $member->{online},
+        };
+    }
+
+    return $nodelist;
+}
+
 # only stored in a in-memory hashtable inside pmxcfs, local data is gone after
 # a restart (of pmxcfs or the node), peer data is still available then
 # best used for status data, like running (ceph) services, package versions, ...

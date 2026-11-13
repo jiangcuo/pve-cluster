@@ -8,6 +8,8 @@ use File::Path;
 use File::Basename;
 use Time::HiRes qw(usleep);
 
+use JSON;
+
 use PVE::Tools qw(run_command);
 use PVE::Cluster;
 use PVE::INotify;
@@ -114,6 +116,9 @@ __PACKAGE__->register_method({
 
     code => sub {
         my ($param) = @_;
+
+        die "QDevice is not supported on a raft cluster\n"
+            if (PVE::Cluster::get_cluster_backend() // '') eq 'raft';
 
         PVE::Corosync::check_conf_exists();
 
@@ -305,6 +310,9 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        die "QDevice is not supported on a raft cluster\n"
+            if (PVE::Cluster::get_cluster_backend() // '') eq 'raft';
+
         PVE::Corosync::check_conf_exists();
 
         my $members = PVE::Cluster::get_members();
@@ -433,7 +441,12 @@ __PACKAGE__->register_method({
             my $local_ip_address = PVE::Cluster::remote_node_ip($nodename);
             my $links = PVE::Corosync::extract_corosync_link_args($param);
 
-            PVE::Cluster::Setup::assert_joinable($local_ip_address, $links, $param->{force});
+            # a corosync cluster member joining a raft cluster is converted, decided once we
+            # know the backend of the other side
+            my $in_corosync_cluster = (PVE::Cluster::get_cluster_backend() // '') eq 'corosync';
+
+            PVE::Cluster::Setup::assert_joinable($local_ip_address, $links, $param->{force})
+                if !$in_corosync_cluster;
 
             PVE::Cluster::Setup::setup_sshd_config();
             PVE::Cluster::Setup::setup_rootsshconfig();
@@ -462,6 +475,51 @@ __PACKAGE__->register_method({
             );
 
             PVE::Cluster::Setup::assert_we_can_join_cluster_version($remote_apiver);
+
+            my $remote_raft = system(
+                'ssh', $host, '-o', 'BatchMode=yes', 'test', '-f', '/var/lib/pve-cluster/raft.conf',
+            ) == 0;
+
+            my $converting = 0;
+            if ($in_corosync_cluster) {
+                if ($remote_raft) {
+                    die "this node is a member of a corosync cluster - use --force to convert it"
+                        . " to the raft cluster of '$host'\n"
+                        if !$param->{force};
+                    PVE::Cluster::Setup::raft_convert_precheck();
+                    my $local = PVE::Cluster::Setup::raft_convert_local_node();
+                    $local_ip_address = $local->{ip};
+                    $param->{nodeid} //= $local->{nodeid};
+                    $converting = 1;
+                } else {
+                    PVE::Cluster::Setup::assert_joinable(
+                        $local_ip_address, $links, $param->{force},
+                    );
+                }
+            }
+
+            if ($remote_raft) {
+                die "raft cluster nodes use a single address (link0), use a bond for redundancy\n"
+                    if grep { $_ != 0 } keys %$links;
+                my $address = $links->{0} ? $links->{0}->{address} : $local_ip_address;
+
+                $cmd = [
+                    'ssh', $host, '-o', 'BatchMode=yes', 'pvesh', 'create',
+                    "/cluster/config/nodes/$nodename", '--output-format', 'json',
+                    '--new_node_ip', $address,
+                    '--apiversion', PVE::Cluster::Setup::JOIN_API_VERSION,
+                ];
+                push @$cmd, '--nodeid', $param->{nodeid} if $param->{nodeid};
+
+                my $out = '';
+                run_command(
+                    $cmd,
+                    outfunc => sub { $out .= shift },
+                    errmsg => "unable to add node",
+                );
+                PVE::Cluster::Setup::finish_join_raft($nodename, decode_json($out), $converting);
+                return;
+            }
 
             $cmd =
                 ['ssh', $host, '-o', 'BatchMode=yes', 'pvecm', 'addnode', $nodename, '--force', 1];
@@ -542,6 +600,31 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+            my $status = PVE::Cluster::get_raft_status();
+            my $leader = (grep { $_->{id} == $status->{leader} } $status->{members}->@*)[0];
+
+            printf "Cluster information\n";
+            printf "-------------------\n";
+            printf "%-17s %s\n", 'Name:', $status->{cluster};
+            printf "%-17s %s\n", 'Backend:', 'raft';
+            printf "%-17s %s\n", 'Quorate:', $status->{quorate} ? 'Yes' : 'No';
+            printf "%-17s %s\n", 'Leader:',
+                $leader ? "$leader->{name} (id $leader->{id})" : '-';
+            printf "%-17s %s\n", 'Term:', $status->{term};
+            printf "%-17s %s\n", 'Voters:', $status->{voters};
+            printf "\n";
+            printf "Membership information\n";
+            printf "----------------------\n";
+            printf "%10s %-8s %-7s %s\n", 'Nodeid', 'Role', 'Online', 'Name (IP)';
+            for my $m (sort { $a->{id} <=> $b->{id} } $status->{members}->@*) {
+                printf "%10d %-8s %-7s %s (%s)%s\n", $m->{id}, $m->{role},
+                    $m->{online} ? 'yes' : 'no', $m->{name}, $m->{ip},
+                    $m->{id} == $status->{nodeid} ? ' (local)' : '';
+            }
+            return undef;
+        }
+
         PVE::Corosync::check_conf_exists();
         my $conf = eval { PVE::Cluster::cfs_read_file("corosync.conf") } // {};
         warn "$@" if $@;
@@ -582,6 +665,16 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        if ((PVE::Cluster::get_cluster_backend() // '') eq 'raft') {
+            my $status = PVE::Cluster::get_raft_status();
+            printf "%10s %-8s %s\n", 'Nodeid', 'Role', 'Name';
+            for my $m (sort { $a->{id} <=> $b->{id} } $status->{members}->@*) {
+                printf "%10d %-8s %s%s\n", $m->{id}, $m->{role}, $m->{name},
+                    $m->{id} == $status->{nodeid} ? ' (local)' : '';
+            }
+            return undef;
+        }
+
         PVE::Corosync::check_conf_exists();
 
         exec('corosync-quorumtool', '-l');
@@ -608,6 +701,9 @@ __PACKAGE__->register_method({
 
     code => sub {
         my ($param) = @_;
+
+        die "not supported on a raft cluster\n"
+            if (PVE::Cluster::get_cluster_backend() // '') eq 'raft';
 
         PVE::Corosync::check_conf_exists();
 
