@@ -882,7 +882,8 @@ sub complete_migration_target {
 
 # NOTE: filesystem must be offline here, no DB changes allowed
 sub cfs_backup_database {
-    mkdir $dbbackupdir;
+    mkdir $dbbackupdir or $!{EEXIST} or die "failed to create backup dir - $!\n";
+    chmod 0700, $dbbackupdir or die "failed to set mode for backup dir - $!\n";
 
     my $ctime = time();
     my $backup_fn = "$dbbackupdir/config-$ctime.sql.gz";
@@ -902,8 +903,17 @@ sub cfs_backup_database {
             unlink $1;
         }
     }
+}
 
-    return $dbfile;
+# NOTE: Should only be called during cluster join to remove the old database.
+sub cfs_unlink_db_unsafe {
+    unlink $dbfile or $!{ENOENT} or warn "failed to remove old config database - $!\n";
+}
+
+# NOTE: Should only be called during cluster join when backup failed.
+sub cfs_rename_db_unsafe {
+    my $ctime = time();
+    rename $dbfile, "$dbfile.$ctime.bak" or warn "failed to rename old config database - $!\n";
 }
 
 1;
